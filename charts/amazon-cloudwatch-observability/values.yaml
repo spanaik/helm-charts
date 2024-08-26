@@ -535,7 +535,7 @@ agent:
     repository: sagewatch-agent
     tag: latest
     repositoryDomainMap:
-      public: 037647485236.dkr.ecr.eu-west-1.amazonaws.com/sagewatch-agent
+      public: 037647485236.dkr.ecr.eu-west-1.amazonaws.com
   enabled: true
   resources:
     requests:
