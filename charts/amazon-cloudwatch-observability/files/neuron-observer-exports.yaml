@@ -1,0 +1,283 @@
+metrics:
+  # Device-scope metrics
+  - power_min
+  - power_max
+  - power_avg
+  - host_mem_dma_buffers
+  - host_mem_tensors
+  - host_mem_constants
+  - host_mem_application_memory
+  - host_mem_driver_memory
+  - host_mem_notifications
+  - host_mem_dma_rings
+  - host_mem_uncategorized
+  - device_memory_capacity
+  - mem_usage_code_host
+  - mem_usage_tensors_host
+  - mem_usage_constants_host
+  - mem_usage_scratchpad_host
+  - mem_usage_misc_host
+  - mem_usage_total_host
+  - process_rss
+  - vcpu_usage_user
+  - vcpu_usage_system
+  - vcpu_user_percent
+  - vcpu_nice_percent
+  - vcpu_system_percent
+  - vcpu_idle_percent
+  - vcpu_iowait_percent
+  - vcpu_irq_percent
+  - vcpu_softirq_percent
+  - mem_ecc_corrected
+  - mem_ecc_corrected_delta
+  - mem_ecc_uncorrected
+  - mem_ecc_unrepairable_uncorrected
+  - mem_ecc_repairable_uncorrected
+  - sram_ecc_corrected
+  - sram_ecc_corrected_delta
+  - sram_ecc_uncorrected
+
+  # Core-scope metrics
+  - device_mem_model_code
+  - device_mem_tensors
+  - device_mem_constants
+  - device_mem_model_shared_scratchpad
+  - device_mem_uncategorized
+  - device_mem_runtime_memory
+  - device_mem_driver_memory
+  - device_mem_collectives
+  - device_mem_nonshared_scratchpad
+  - device_mem_notifications
+  - device_mem_dma_rings
+  - mem_usage_total_device
+  - hw_err_collectives
+  - hw_err_hbm_ue
+  - hw_err_nc_ue
+  - hw_err_dma_abort
+  - hw_err_repairable_hbm_ue
+  - err_sw_nq_overflow
+  - err_sw_semaphore_error
+  - err_sw_event_error
+  - err_sw_psum_collision
+  - err_sw_sequencer_fatal
+  - infer_completed
+  - infer_completed_with_err
+  - infer_completed_with_num_err
+  - infer_timed_out
+  - infer_incorrect_input
+  - infer_failed_to_queue
+  - inference_count
+  - model_load_count
+  - loaded_model_count
+  - flop_count
+  - err_generic
+  - err_numerical
+  - err_model
+  - err_transient
+  - err_hw
+  - err_rt
+  - generic_fail
+  - err_resource
+  - err_resource_nc
+  - err_invalid
+  - err_unsupported_neff_version
+  - latency_device
+  - latency_total
+  - latency_device_p0
+  - latency_device_p1
+  - latency_device_p25
+  - latency_device_p50
+  - latency_device_p75
+  - latency_device_p99
+  - latency_device_p100
+  - latency_total_p0
+  - latency_total_p1
+  - latency_total_p25
+  - latency_total_p50
+  - latency_total_p75
+  - latency_total_p99
+  - latency_total_p100
+  - nc_time
+  - cc_time
+  - time_in_use
+  - reset_req_count
+  - reset_fail_count
+  - utilization
+  - effective_flops
+
+  # System-scope metrics
+  - memory_total_bytes
+  - memory_used_bytes
+  - swap_total_bytes
+  - swap_used_bytes
+  - cpu_average_usage
+  - context_switch_count
+  - vcpu_count
+  - neuron_device_count
+  - physical_neuroncore_count
+  - logical_neuroncore_count
+
+  # EFA-scope metrics, emitted per interface (neuron.efa.<name> with
+  # efa_device/efa_port). Names match the sysfs hw_counters filenames. No
+  # node rollup: the backend sums across efa_device/efa_port, and an
+  # aggregation entry here would replace the per-interface series rather than
+  # add to it (see exports.rs as_otel_exports).
+  - tx_bytes
+  - rx_bytes
+  - tx_pkts
+  - rx_pkts
+  - rx_drops
+  - send_bytes
+  - recv_bytes
+  - send_wrs
+  - recv_wrs
+  - rdma_write_wrs
+  - rdma_read_wrs
+  - rdma_write_bytes
+  - rdma_read_bytes
+  - rdma_write_wr_err
+  - rdma_read_wr_err
+  - rdma_read_resp_bytes
+  - rdma_write_recv_bytes
+  - retrans_bytes
+  - retrans_pkts
+  - retrans_timeout_events
+  - impaired_remote_conn_events
+  - unresponsive_remote_events
+
+aggregations:
+  - { name: power_min, scope: device, strategy: [min] }
+  - { name: power_max, scope: device, strategy: [max] }
+  - { name: power_avg, scope: device, strategy: [avg] }
+  - { name: host_mem_dma_buffers, scope: system, strategy: [sum] }
+  - { name: host_mem_tensors, scope: system, strategy: [sum] }
+  - { name: host_mem_constants, scope: system, strategy: [sum] }
+  - { name: host_mem_application_memory, scope: system, strategy: [sum] }
+  - { name: host_mem_driver_memory, scope: system, strategy: [sum] }
+  - { name: host_mem_notifications, scope: system, strategy: [sum] }
+  - { name: host_mem_dma_rings, scope: system, strategy: [sum] }
+  - { name: host_mem_uncategorized, scope: system, strategy: [sum] }
+  - { name: device_memory_capacity, scope: system, strategy: [sum] }
+  - { name: mem_usage_code_host, scope: system, strategy: [sum] }
+  - { name: mem_usage_tensors_host, scope: system, strategy: [sum] }
+  - { name: mem_usage_constants_host, scope: system, strategy: [sum] }
+  - { name: mem_usage_scratchpad_host, scope: system, strategy: [sum] }
+  - { name: mem_usage_misc_host, scope: system, strategy: [sum] }
+  - { name: mem_usage_total_host, scope: system, strategy: [sum] }
+  - { name: process_rss, scope: system, strategy: [sum] }
+  - { name: vcpu_usage_user, scope: system, strategy: [sum] }
+  - { name: vcpu_usage_system, scope: system, strategy: [sum] }
+  - { name: vcpu_user_percent, scope: system, strategy: [avg] }
+  - { name: vcpu_system_percent, scope: system, strategy: [avg] }
+  - { name: vcpu_nice_percent, scope: system, strategy: [avg] }
+  - { name: vcpu_idle_percent, scope: system, strategy: [avg] }
+  - { name: vcpu_iowait_percent, scope: system, strategy: [avg] }
+  - { name: vcpu_irq_percent, scope: system, strategy: [avg] }
+  - { name: vcpu_softirq_percent, scope: system, strategy: [avg] }
+  - { name: mem_ecc_corrected, scope: system, strategy: [sum] }
+  - { name: mem_ecc_corrected_delta, scope: system, strategy: [sum] }
+  - { name: mem_ecc_uncorrected, scope: system, strategy: [sum] }
+  - { name: mem_ecc_unrepairable_uncorrected, scope: system, strategy: [sum] }
+  - { name: mem_ecc_repairable_uncorrected, scope: system, strategy: [sum] }
+  - { name: sram_ecc_corrected, scope: system, strategy: [sum] }
+  - { name: sram_ecc_corrected_delta, scope: system, strategy: [sum] }
+  - { name: sram_ecc_uncorrected, scope: system, strategy: [sum] }
+  - { name: device_mem_model_code, scope: system, strategy: [sum] }
+  - { name: device_mem_tensors, scope: system, strategy: [sum] }
+  - { name: device_mem_constants, scope: system, strategy: [sum] }
+  - { name: device_mem_model_shared_scratchpad, scope: system, strategy: [sum] }
+  - { name: device_mem_uncategorized, scope: system, strategy: [sum] }
+  - { name: device_mem_runtime_memory, scope: system, strategy: [sum] }
+  - { name: device_mem_driver_memory, scope: system, strategy: [sum] }
+  - { name: device_mem_collectives, scope: system, strategy: [sum] }
+  - { name: device_mem_nonshared_scratchpad, scope: system, strategy: [sum] }
+  - { name: device_mem_notifications, scope: system, strategy: [sum] }
+  - { name: device_mem_dma_rings, scope: system, strategy: [sum] }
+  - { name: mem_usage_total_device, scope: system, strategy: [sum] }
+  - { name: hw_err_collectives, scope: system, strategy: [sum] }
+  - { name: hw_err_hbm_ue, scope: system, strategy: [sum] }
+  - { name: hw_err_nc_ue, scope: system, strategy: [sum] }
+  - { name: hw_err_dma_abort, scope: system, strategy: [sum] }
+  - { name: hw_err_repairable_hbm_ue, scope: system, strategy: [sum] }
+  - { name: err_sw_nq_overflow, scope: system, strategy: [sum] }
+  - { name: err_sw_semaphore_error, scope: system, strategy: [sum] }
+  - { name: err_sw_event_error, scope: system, strategy: [sum] }
+  - { name: err_sw_psum_collision, scope: system, strategy: [sum] }
+  - { name: err_sw_sequencer_fatal, scope: system, strategy: [sum] }
+  - { name: infer_completed, scope: system, strategy: [sum, avg] }
+  - { name: infer_completed_with_err, scope: system, strategy: [sum] }
+  - { name: infer_completed_with_num_err, scope: system, strategy: [sum] }
+  - { name: infer_timed_out, scope: system, strategy: [sum] }
+  - { name: infer_incorrect_input, scope: system, strategy: [sum] }
+  - { name: infer_failed_to_queue, scope: system, strategy: [sum] }
+  - { name: inference_count, scope: system, strategy: [sum] }
+  - { name: model_load_count, scope: system, strategy: [sum] }
+  - { name: loaded_model_count, scope: system, strategy: [sum] }
+  - { name: flop_count, scope: system, strategy: [sum] }
+  - { name: err_generic, scope: system, strategy: [sum] }
+  - { name: err_numerical, scope: system, strategy: [sum] }
+  - { name: err_model, scope: system, strategy: [sum] }
+  - { name: err_transient, scope: system, strategy: [sum] }
+  - { name: err_hw, scope: system, strategy: [sum] }
+  - { name: err_rt, scope: system, strategy: [sum] }
+  - { name: generic_fail, scope: system, strategy: [sum] }
+  - { name: err_resource, scope: system, strategy: [sum] }
+  - { name: err_resource_nc, scope: system, strategy: [sum] }
+  - { name: err_invalid, scope: system, strategy: [sum] }
+  - { name: err_unsupported_neff_version, scope: system, strategy: [sum] }
+  # `_system` stems keep these node rollups from colliding with the per-core
+  # `latency_*_p50`/`_p99` NDS percentile metrics, which sanitize to the same
+  # Prometheus name (`.p50` and `_p50` both become `_p50`).
+  - { name: latency_device, scope: system, strategy: [avg, p50, p99], aggregated_name: latency_device_system }
+  - { name: latency_total, scope: system, strategy: [avg, p50, p99], aggregated_name: latency_total_system }
+  - { name: nc_time, scope: system, strategy: [sum] }
+  - { name: cc_time, scope: system, strategy: [sum] }
+  - { name: time_in_use, scope: system, strategy: [sum, avg, max] }
+  - { name: reset_req_count, scope: system, strategy: [sum] }
+  - { name: reset_fail_count, scope: system, strategy: [sum] }
+  - { name: utilization, scope: system, strategy: [sum, avg, max], aggregated_name: utilization_system }
+  - { name: utilization, scope: core, strategy: [sum, avg, max] }
+  - { name: effective_flops, scope: system, strategy: [sum] }
+
+  # ── Solstice additions: per-core inf/s, err/s and memory ──────────────────
+  # These metrics are already core-scope (see the Core-scope list above); they
+  # only reached CloudWatch as node rollups because their sole aggregation entry
+  # was scope: system. A scope: core entry emits them per NeuronCore, which also
+  # gives awsdevicepodcorrelation a `neuroncore` key to attribute to a pod.
+  #
+  # `aggregated_name: *_core` goes on the CORE entry, not the system one. Both
+  # scopes otherwise sanitize to the same Prometheus name; upstream's convention
+  # puts `_system` on the rollup, but doing that here would RENAME the existing
+  # neuron_core_infer_completed_sum_total and break current consumers.
+  #
+  # Memory uses max, not sum: it is a gauge, so summing samples within the
+  # collection window would inflate it. Counters keep sum, matching their
+  # system entries.
+  - { name: infer_completed, scope: core, strategy: [sum], aggregated_name: infer_completed_core }
+  - { name: infer_completed_with_err, scope: core, strategy: [sum], aggregated_name: infer_completed_with_err_core }
+  - { name: mem_usage_total_device, scope: core, strategy: [max], aggregated_name: mem_usage_total_device_core }
+
+info_metrics:
+  system_info:
+    - instance_type
+    - instance_name
+    - region
+    - availability_zone
+    - availability_zone_id
+    - subnet_id
+    - ami_id
+    - ultraserver_id
+    - ultraserver_type
+    - ultraserver_mode
+    - ultraserver_size
+    - ultraserver_instance_index
+  device_info:
+    - device_arch_type
+    - core_arch_type
+    - device_name
+    - physical_neuroncore_per_device_count
+    - logical_neuroncore_per_device_count
+    - serial_number
+    - driver_version
+    - connected_devices
+    - logical_neuroncore_config

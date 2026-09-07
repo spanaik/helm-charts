@@ -58,7 +58,26 @@ receivers:
                 - dcgm-exporter-service:9400
   {{- end }}
 
-  {{- if .Values.neuronMonitor.enabled }}
+  {{- if include "neuron-observer.otelEnabled" . }}
+  prometheus/cw_k8s_ci_v0_neuron_observer:
+    config:
+      scrape_configs:
+        - job_name: neuron-observer
+          scrape_interval: {{ .Values.otelContainerInsights.metricResolution }}
+          scrape_timeout: {{ include "otel-container-insights.scrapeTimeout" . }}
+          # http, not https: the daemon exposes no TLS listener.
+          scheme: http
+          metrics_path: /metrics
+          static_configs:
+            - targets:
+                - {{ include "neuron-observer.name" . }}-service:{{ .Values.neuronObserver.service.port }}
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              action: keep
+              regex: up|neuron_.*
+  {{- end }}
+
+  {{- if include "neuron-monitor.otelEnabled" . }}
   prometheus/cw_k8s_ci_v0_neuron:
     config:
       scrape_configs:
@@ -305,7 +324,7 @@ processors:
           - set(attributes["cloudwatch.pipeline"], "dcgm")
   {{- end }}
 
-  {{- if .Values.neuronMonitor.enabled }}
+  {{- if include "neuron-monitor.otelEnabled" . }}
   transform/cw_k8s_ci_v0_set_scope_neuron_monitor:
     error_mode: ignore
     metric_statements:
@@ -610,7 +629,45 @@ processors:
           - delete_key(attributes, "pci_bus_id") where attributes["pci_bus_id"] != nil
   {{- end }}
 
-  {{- if .Values.neuronMonitor.enabled }}
+  {{- if include "neuron-observer.otelEnabled" . }}
+  # awsdevicepodcorrelation keys on `neurondevice`; the observer emits
+  # `neuron_device_index`. Dropped again below, so the label set is unchanged.
+  transform/cw_k8s_ci_v0_neuron_observer_device_attrs:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["neurondevice"], attributes["neuron_device_index"]) where attributes["neuron_device_index"] != nil
+
+  transform/cw_k8s_ci_v0_neuron_observer_drop_corr_key:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - delete_key(attributes, "neurondevice") where attributes["neurondevice"] != nil
+
+  # Own copy: the gates are mutually exclusive, so reusing the neuron-monitor one
+  # would always dangle. Also drops runtime_tag, which the observer keeps.
+  groupbyattrs/cw_k8s_ci_v0_neuron_observer:
+    keys:
+      - k8s.pod.name
+      - k8s.namespace.name
+      - k8s.container.name
+
+  transform/cw_k8s_ci_v0_set_scope_neuron_observer:
+    error_mode: ignore
+    metric_statements:
+      - context: scope
+        statements:
+          - set(scope.name, "neuron-observer")
+          - set(scope.version, "{{ .Values.neuronObserver.image.tag }}")
+          - set(scope.schema_url, "")
+          - set(attributes["cloudwatch.source"], "cloudwatch-agent")
+          - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
+          - set(attributes["cloudwatch.pipeline"], "neuron-observer")
+  {{- end }}
+
+  {{- if include "neuron-monitor.otelEnabled" . }}
   filter/cw_k8s_ci_v0_neuron:
     error_mode: ignore
     metrics:
@@ -919,7 +976,34 @@ service:
         - otlphttp/cw_k8s_ci_v0_metrics_dest
     {{- end }}
 
-    {{- if .Values.neuronMonitor.enabled }}
+    {{- if include "neuron-observer.otelEnabled" . }}
+    metrics/cw_k8s_ci_v0_neuron_observer:
+      receivers: [prometheus/cw_k8s_ci_v0_neuron_observer]
+      processors:
+        - filter/cw_k8s_ci_v0_scrape_metadata
+        - metricstarttime/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_set_cluster_name
+        - transform/cw_k8s_ci_v0_set_unit
+        - transform/cw_k8s_ci_v0_neuron_observer_device_attrs
+        - awsdevicepodcorrelation/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_neuron_observer_drop_corr_key
+        - groupbyattrs/cw_k8s_ci_v0_neuron_observer
+        - k8sattributes/cw_k8s_ci_v0_pod
+        - transform/cw_k8s_ci_v0_set_node_name
+        - transform/cw_k8s_ci_v0_promote_node_name
+        - resourcedetection/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_set_cloud_resource_id
+        - k8sattributes/cw_k8s_ci_v0_node
+        - transform/cw_k8s_ci_v0_set_scope_neuron_observer
+        - transform/cw_k8s_ci_v0_clear_schema_url
+        - transform/cw_k8s_ci_v0_set_workload
+        - awsattributelimit/cw_k8s_ci_v0
+        - batch/cw_k8s_ci_v0_metrics_dest
+      exporters:
+        - otlphttp/cw_k8s_ci_v0_metrics_dest
+    {{- end }}
+
+    {{- if include "neuron-monitor.otelEnabled" . }}
     metrics/cw_k8s_ci_v0_neuron:
       receivers: [prometheus/cw_k8s_ci_v0_neuron]
       processors:

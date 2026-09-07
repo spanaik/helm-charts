@@ -382,6 +382,36 @@ Name for neuron-monitor
 {{- end }}
 
 {{/*
+Name for neuron-observer
+*/}}
+{{- define "neuron-observer.name" -}}
+{{- default "neuron-observer" .Values.neuronObserver.name }}
+{{- end }}
+
+{{/*
+Which collector serves Neuron on the OTEL CI path; at most one renders non-empty.
+neuronObserver.enabled unset follows neuronMonitor; set explicitly it wins, which
+is what makes "EMF on neuron-monitor, OTEL on neuron-observer" expressible.
+*/}}
+{{- define "neuron-observer.otelEnabled" -}}
+{{- if .Values.otelContainerInsights.enabled -}}
+{{- if kindIs "invalid" .Values.neuronObserver.enabled -}}
+{{- if not .Values.neuronMonitor.enabled -}}true{{- end -}}
+{{- else if .Values.neuronObserver.enabled -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+neuronMonitor.enabled still gates the DaemonSet, which EMF needs; this is only
+whether it also feeds the OTEL pipeline.
+*/}}
+{{- define "neuron-monitor.otelEnabled" -}}
+{{- if and .Values.otelContainerInsights.enabled .Values.neuronMonitor.enabled -}}
+{{- if not (include "neuron-observer.otelEnabled" .) -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Get the current recommended cloudwatch agent image for a region
 */}}
 {{- define "cloudwatch-agent.image" -}}
@@ -509,6 +539,27 @@ Get the current recommended neuron-monitor image for a region
 {{- end -}}
 
 {{/*
+Get the current recommended neuron-observer image for a region
+*/}}
+{{- define "neuron-observer.image" -}}
+{{- $imageDomain := "" -}}
+{{- $imageDomain = index .Values.neuronObserver.image.repositoryDomainMap .Values.region -}}
+{{- if not $imageDomain -}}
+{{- $imageDomain = .Values.neuronObserver.image.repositoryDomainMap.public -}}
+{{- end -}}
+{{- printf "%s/%s:%s" $imageDomain .Values.neuronObserver.image.repository .Values.neuronObserver.image.tag -}}
+{{- end -}}
+
+{{/*
+Checksum over both neuron-observer config files, so a change to either rolls the
+DaemonSet. The daemon reads config.yaml and exports.yaml only at startup, so
+without this a config change lands in the ConfigMap and is never picked up.
+*/}}
+{{- define "neuron-observer.configchecksum" -}}
+{{- printf "%s|%s|%s" (.Values.neuronObserver.listenAddress | toString) (.Values.neuronObserver.service.port | toString) (.Files.Get "files/neuron-observer-exports.yaml") | sha256sum -}}
+{{- end -}}
+
+{{/*
 Set DCGM_EXPORTER_INTERVAL environment variable for dcgmExporter if accelerated_compute_gpu_metrics_collection_interval is set and less than 60
 */}}
 {{- define "dcgm-exporter.env" -}}
@@ -612,6 +663,13 @@ Create the name of the service account to use for neuron monitor
 */}}
 {{- define "neuron-monitor.serviceAccountName" -}}
 {{- default "neuron-monitor-service-acct" .Values.neuronMonitor.serviceAccount.name }}
+{{- end }}
+
+{{/*
+Create the name of the service account to use for neuron observer
+*/}}
+{{- define "neuron-observer.serviceAccountName" -}}
+{{- default "neuron-observer-service-acct" .Values.neuronObserver.serviceAccount.name }}
 {{- end }}
 
 {{- define "amazon-cloudwatch-observability.podAnnotations" -}}

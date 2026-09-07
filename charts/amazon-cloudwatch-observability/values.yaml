@@ -976,7 +976,10 @@ dcgmExporter:
   nodeSelector:
     kubernetes.io/os: linux
 neuronMonitor:
-  enabled: true
+  ## Off in this beta, which puts neuronObserver on the OTEL path. Set true to
+  ## opt back into neuron-monitor; neuronObserver then turns itself off. Also
+  ## required for Neuron on EMF, whichever collector serves OTEL.
+  enabled: false
   name:
   image:
     repository: neuron-monitor
@@ -1004,6 +1007,87 @@ neuronMonitor:
     capabilities:
       add:
         - SYS_ADMIN
+  serviceAccount:
+    name: # override exporter service account name
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                  ## Tranium/Infrentia instance types
+                  - trn1.2xlarge
+                  - trn1.32xlarge
+                  - trn1n.32xlarge
+                  - trn2.3xlarge
+                  - trn2.48xlarge
+                  - trn2a.48xlarge
+                  - trn2n.48xlarge
+                  - trn2u.48xlarge
+                  - inf1.xlarge
+                  - inf1.2xlarge
+                  - inf1.6xlarge
+                  - inf1.24xlarge
+                  - inf2.xlarge
+                  - inf2.8xlarge
+                  - inf2.24xlarge
+                  - inf2.48xlarge
+                  - ml.trn1.2xlarge
+                  - ml.trn1.32xlarge
+                  - ml.trn1n.32xlarge
+                  - ml.inf1.xlarge
+                  - ml.inf1.2xlarge
+                  - ml.inf1.6xlarge
+                  - ml.inf1.24xlarge
+                  - ml.inf2.xlarge
+                  - ml.inf2.8xlarge
+                  - ml.inf2.24xlarge
+                  - ml.inf2.48xlarge
+              - key: eks.amazonaws.com/compute-type
+                operator: NotIn
+                values:
+                  - fargate
+  nodeSelector:
+    kubernetes.io/os: linux
+
+
+## NeuronObserver, the AWS Neuron team's observability daemon: the Neuron source
+## on the OTEL Container Insights path. EMF is always served by neuronMonitor.
+## The two OTEL collectors are mutually exclusive — both would double-count.
+##
+##   otelContainerInsights  neuronMonitor  neuronObserver  →  OTEL Neuron source
+##   false                  any            any                none
+##   true                   false          unset              neuron-observer
+##   true                   true           unset              neuron-monitor
+##   true                   true           true               neuron-observer
+##   true                   any            false              none
+neuronObserver:
+  ## Unset follows neuronMonitor per the table; true/false pins it.
+  enabled:
+  name:
+  image:
+    repository: neuron-observer
+    ## Digest-derived tag of a mirrored build; no upstream semver tag exists yet.
+    tag: src-986cf0ace2a1
+    repositoryDomainMap:
+      public: 322962300869.dkr.ecr.us-west-2.amazonaws.com
+  resources:
+    limits:
+      cpu: 500m
+      memory: 500Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  ## Override root tolerations
+  # tolerations: []
+  service:
+    type: ClusterIP
+    port: 7001
+  ## Not the daemon's 127.0.0.1 default: the agent is a different pod on the same
+  ## node, so a loopback listener is unreachable and the scrape reports `up 0`.
+  listenAddress: 0.0.0.0
   serviceAccount:
     name: # override exporter service account name
   affinity:
@@ -1129,7 +1213,10 @@ nodeExporter:
 ## When set to false, the kubernetes key is removed from the agent config, disabling legacy CI metrics collection.
 ## Can run alongside otelContainerInsights — both pipelines are independent.
 containerInsights:
-  enabled: true
+  ## Off in this beta: OTEL Container Insights is the only metrics path. This
+  ## empties the ContainerInsights namespace and with it the console's legacy
+  ## dimension-based dashboards, including every Neuron and UltraServer widget.
+  enabled: false
   ## The agent in the agents array that receives legacy Container Insights config.
   targetAgent: "cloudwatch-agent"
 
@@ -1158,7 +1245,9 @@ applicationSignals:
 ##   enabled=true, logs.enabled=false   → OTEL metrics only
 ##
 otelContainerInsights:
-  enabled: false
+  ## On in this beta: with containerInsights (EMF) off this is the only metrics
+  ## path, and the only path neuronObserver runs on.
+  enabled: true
   ## OTEL-native CI log pipelines (application, host).
   ## Only takes effect when otelContainerInsights.enabled is true.
   logs:

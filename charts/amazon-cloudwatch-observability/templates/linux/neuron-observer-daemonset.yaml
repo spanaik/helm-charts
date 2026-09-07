@@ -1,0 +1,126 @@
+{{- if include "neuron-observer.otelEnabled" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ template "neuron-observer.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "amazon-cloudwatch-observability.labels" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "neuron-observer.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "amazon-cloudwatch-observability.labels" . | nindent 4 }}
+    k8s-app: {{ include "neuron-observer.name" . }}
+spec:
+  selector:
+    matchLabels:
+      k8s-app: {{ include "neuron-observer.name" . }}
+  template:
+    metadata:
+      labels:
+        k8s-app: {{ include "neuron-observer.name" . }}
+      annotations:
+        # The daemon reads its config only at startup.
+        checksum/config: {{ include "neuron-observer.configchecksum" . }}
+    spec:
+      serviceAccountName: {{ template "neuron-observer.serviceAccountName" . }}
+      {{- with .Values.neuronObserver.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.neuronObserver.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- dict "component" .Values.neuronObserver "context" . | include "amazon-cloudwatch-observability.common.tolerations" | nindent 6 }}
+      containers:
+        - name: neuron-observer
+          image: {{ template "neuron-observer.image" . }}
+          args: ["--config", "/etc/neuron-observer/config.yaml"]
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.neuronObserver.service.port }}
+              protocol: TCP
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            {{- toYaml .Values.neuronObserver.resources | nindent 12 }}
+          securityContext:
+            # Driver ioctls on /dev/neuron* plus a host /proc walk. Requesting
+            # aws.amazon.com/neuron instead would leave it Pending wherever a
+            # workload already claims the devices.
+            privileged: true
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: host-proc
+              mountPath: /host-proc
+              readOnly: true
+            - name: config
+              mountPath: /etc/neuron-observer
+              readOnly: true
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: config
+          configMap:
+            name: {{ include "neuron-observer.name" . }}-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "neuron-observer.name" . }}-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "amazon-cloudwatch-observability.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ include "neuron-observer.name" . }}
+spec:
+  type: ClusterIP
+  # Each agent must scrape its OWN node; otherwise the Service load-balances and
+  # agents report random nodes' accelerators.
+  internalTrafficPolicy: Local
+  ports:
+    - name: metrics
+      port: {{ .Values.neuronObserver.service.port }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    k8s-app: {{ include "neuron-observer.name" . }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "neuron-observer.name" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "amazon-cloudwatch-observability.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    collection:
+      proc_path: /host-proc
+    daemon:
+      listen_address: {{ .Values.neuronObserver.listenAddress | quote }}
+      port: {{ .Values.neuronObserver.service.port }}
+    export:
+      metrics_config: /etc/neuron-observer/exports.yaml
+  # Overrides the image's exports.yaml, which aggregates inference, error and
+  # memory metrics at system scope only — no `neuroncore` label, so no per-core
+  # data and nothing for awsdevicepodcorrelation to key on.
+  exports.yaml: |
+{{ .Files.Get "files/neuron-observer-exports.yaml" | indent 4 }}
+{{- end }}
