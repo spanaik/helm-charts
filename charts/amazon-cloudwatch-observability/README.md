@@ -68,6 +68,67 @@ runs `k8sattributes` pod association, so `k8s.workload.name` resolves to the own
 Deployment rather than to the ReplicaSet — whose pod-template hash likewise changes on
 every redeploy.
 
+### Engine configuration Info metric
+
+`vllm_engine_config_info` records how each vLLM engine was started. It is a gauge with the
+value 1. There is one series per vLLM pod. The engine's startup settings are labels on the
+series:
+
+- version: `vllm_version`, `vllm_engine`
+- model: `model`, `served_model_name`, `dtype`, `max_seq_len`, `quantization`, `kv_cache_dtype`
+- parallelism: `tensor_parallel_size`, `pipeline_parallel_size`, `data_parallel_size`
+- features: `enforce_eager`, `enable_prefix_caching`, `speculative_method`
+
+Older vLLM versions log fewer settings. If the startup line does not log a setting, its label
+is left out.
+
+It is off by default. Turn it on with `otelContainerInsights.solutions.vllm.configInfo.enabled=true`.
+It needs an agent image with the `signal_to_info_metric` connector. An older agent fails to
+start with it on.
+
+The agent on each node reads the engine startup line from the pod's log. The line starts with
+`Initializing ... LLM engine (v...)`. The agent sends each series again every
+`configInfo.emitInterval`.
+Empty means `otelContainerInsights.metricResolution`. The value is `<N>s`, `<N>m` or `<N>h`,
+from 1s to 24h. When a pod is deleted, or replaced by a new pod with the same name, its series
+stops.
+
+Caps, per agent:
+
+- `maxEntities` (default 500): the number of vLLM pods tracked.
+- `maxStateBytes` (default 1048576): the size of the stored settings, in bytes.
+- `maxValueLength` (default 256): the length of each label value.
+
+The agent keeps the settings in `otelContainerInsights.stateStorage`, so they survive an agent
+restart. The Info metric turns the storage on by itself. The storage is a hostPath directory
+(`stateStorage.hostPath`, default `/var/lib/amazon-cloudwatch-agent/otel-state`). It is mounted
+read-write into the node agent DaemonSet only. One agent pod at a time locks the storage files.
+So the agent's `updateStrategy.rollingUpdate.maxSurge` must be 0, which is the DaemonSet
+default. The chart fails to render otherwise.
+
+With `otelContainerInsights.logs.enabled=false`, the agent still reads the pod logs on the
+node, but only for this metric. It keeps only the engine startup line and ships no logs. On its
+first start it reads the existing log files from the beginning, so it finds the engines that
+are already running. After that it continues from where it stopped.
+
+With logs on, the agent reads only new log lines. For a vLLM pod that is already running at
+that time, the series starts after the pod's next restart.
+
+To add the engine settings to another vLLM metric, join on the pod:
+
+```promql
+sum by ("@resource.k8s.pod.uid") ({"vllm:num_requests_running"})
+  * on ("@resource.k8s.pod.uid") group_left (vllm_version, model)
+    max by ("@resource.k8s.pod.uid", vllm_version, model) (
+      last_over_time({"vllm_engine_config_info"}[2m])
+    )
+```
+
+Resource attributes are labels with the `@resource.` prefix. The pod UID is unique across
+clusters, and a replacement pod with the same name gets a new one. The `max by` keeps one
+series for each pod and set of settings. Use a `last_over_time` window longer than
+`emitInterval`.
+
 ## KServe control-plane metrics
 
 Set under `otelContainerInsights.solutions.kserve.controlPlane`, on by default. The

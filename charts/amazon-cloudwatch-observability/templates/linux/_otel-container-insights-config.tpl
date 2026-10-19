@@ -1,4 +1,14 @@
 {{- define "otel-container-insights.config" -}}
+{{- /* Shipping logs to CloudWatch Logs. */ -}}
+{{- $logs := .Values.otelContainerInsights.logs.enabled -}}
+{{- /* The vLLM config Info metric: signal_to_info_metric/cw_k8s_ci_v0_vllm. */ -}}
+{{- $configInfo := eq (include "otel-container-insights.configInfoEnabled" .) "true" -}}
+{{- /* file_storage/cw_k8s_ci_v0_state. */ -}}
+{{- $stateStorage := eq (include "otel-container-insights.stateStorageEnabled" .) "true" -}}
+{{- /* filelog/cw_k8s_ci_v0_app and logs/cw_k8s_ci_v0_app: for shipping logs, the Info metric, or both. */ -}}
+{{- $appLogs := eq (include "otel-container-insights.appLogsPipelineEnabled" .) "true" -}}
+{{- /* Logs-off mode: the app-log pipeline runs only to feed the Info metric connector. */ -}}
+{{- $infoOnlyLogs := and $configInfo (not $logs) -}}
 extensions:
   sigv4auth/cw_k8s_ci_v0_metrics_dest:
     region: {{ .Values.region }}
@@ -10,6 +20,22 @@ extensions:
   awscloudwatchlogsprovisioner/cw_k8s_ci_v0_logs:
     region: {{ .Values.region }}
     additional_auth: sigv4auth/cw_k8s_ci_v0_logs_dest
+{{- end }}
+{{- if $stateStorage }}
+  {{- $stateDir := include "otel-container-insights.stateStorageHostPath" . }}
+  # Agent state that must survive a restart: the app-log receiver's file checkpoints
+  # and the vLLM config Info metric's facts. One bbolt file per component, in the
+  # hostPath the targetAgent DaemonSet mounts read-write at the same path.
+  file_storage/cw_k8s_ci_v0_state:
+    directory: {{ $stateDir | quote }}
+    create_directory: true
+    compaction:
+      on_start: true
+      on_rebound: true
+      directory: {{ $stateDir | quote }}
+    # A file that bbolt cannot open (corrupted by a node crash) is renamed aside
+    # and recreated empty, rather than keeping the agent from starting.
+    recreate: true
 {{- end }}
 
 receivers:
@@ -280,7 +306,7 @@ receivers:
       k8s.node.uptime:
         enabled: true
 
-{{- if .Values.otelContainerInsights.logs.enabled }}
+{{- if $appLogs }}
   # ── CI Logs receivers ──
   filelog/cw_k8s_ci_v0_app:
     include:
@@ -292,9 +318,22 @@ receivers:
       # FluentBit's existing Exclude_Path behavior.
       - /var/log/containers/aws-node*
       - /var/log/containers/kube-proxy*
+    {{- if $stateStorage }}
+    # File checkpoints persist in file_storage/cw_k8s_ci_v0_state, so a restarted
+    # agent resumes each file where it stopped, including lines written while it was down.
+    storage: file_storage/cw_k8s_ci_v0_state
+    {{- else }}
     # No checkpoint persistence — logs during agent downtime are lost.
-    # Filestorage support is tracked in a follow-up PR.
+    # otelContainerInsights.stateStorage.enabled persists the checkpoints.
+    {{- end }}
+    {{- if $logs }}
     start_at: end
+    {{- else }}
+    # No logs are shipped in this mode, only the vLLM engine startup line is used, so
+    # reading existing files from the start is safe; it finds the startup line of a
+    # vLLM pod that was already running. Checkpoints keep a restart from re-reading.
+    start_at: beginning
+    {{- end }}
     include_file_path: true
     include_file_name: false
     max_concurrent_files: 100
@@ -315,6 +354,9 @@ receivers:
         to: resource["k8s.container.name"]
       - id: parse_container_log
         type: container_log_parser
+{{- end }}
+
+{{- if $logs }}
 
   filelog/cw_k8s_ci_v0_node:
     include:
@@ -515,9 +557,36 @@ processors:
     error_mode: ignore
     metrics:
       metric:
+        {{- if $configInfo }}
+        # Also keep the config Info metric from signal_to_info_metric/cw_k8s_ci_v0_vllm.
+        - 'not IsMatch(name, "^(vllm:|http_).*") and name != "vllm_engine_config_info"'
+        {{- else }}
         - 'not IsMatch(name, "^(vllm:|http_).*")'
+        {{- end }}
         - 'IsMatch(name, ".*_created$")'
         - 'type == METRIC_DATA_TYPE_SUMMARY'
+  {{- if $configInfo }}
+
+  # The config Info metric's resource carries the UID of the pod whose startup line
+  # it was parsed from (cwagent.info.identity.k8s.pod.uid); k8sattributes has just
+  # added the UID of the pod that has that name now (k8s.pod.uid). They differ once
+  # the pod is replaced under the same name (a StatefulSet pod), and the live UID is
+  # missing once the pod is gone: either way the facts are stale, so drop them. The
+  # scraped vllm:* series carry no identity and pass.
+  filter/cw_k8s_ci_v0_vllm_info_live:
+    error_mode: ignore
+    metrics:
+      datapoint:
+        - 'resource.attributes["cwagent.info.identity.k8s.pod.uid"] != nil and resource.attributes["cwagent.info.identity.k8s.pod.uid"] != resource.attributes["k8s.pod.uid"]'
+
+  # The identity has done its job; k8s.pod.uid identifies the pod from here on.
+  transform/cw_k8s_ci_v0_vllm_info_cleanup:
+    error_mode: ignore
+    metric_statements:
+      - context: resource
+        statements:
+          - delete_key(attributes, "cwagent.info.identity.k8s.pod.uid") where attributes["cwagent.info.identity.k8s.pod.uid"] != nil
+  {{- end }}
   {{- end }}
 
   transform/cw_k8s_ci_v0_set_scope_lis_csi:
@@ -928,6 +997,18 @@ processors:
           - delete_key(attributes, "instance_id") where attributes["instance_id"] != nil
           - delete_key(attributes, "volume_id") where attributes["volume_id"] != nil
 
+{{- if $infoOnlyLogs }}
+  # Logs-off mode: the app-log pipeline only feeds the vLLM config Info metric
+  # connector, so keep just the records that can hold the vLLM engine startup line.
+  # A plain substring check (Index), no regex; the connector's body_contains then
+  # picks the startup line itself.
+  filter/cw_k8s_ci_v0_vllm_info_prefilter:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'Index(body, "LLM engine (v") == -1'
+{{- end }}
+
 {{- if .Values.otelContainerInsights.logs.enabled }}
   # ── CI Logs processors ──
   transform/cw_k8s_ci_v0_logs_set_workload:
@@ -1079,6 +1160,93 @@ exporters:
 
 {{- end }}
 
+{{- if $configInfo }}
+
+connectors:
+  # vLLM engine configuration as an Info metric: one vllm_engine_config_info series
+  # (gauge, value 1) per vLLM pod, parsed from the engine startup log line. A second
+  # exporter of logs/cw_k8s_ci_v0_app and a second receiver of metrics/cw_k8s_ci_v0_vllm,
+  # so it adds no pipeline. The latest facts per pod are kept in
+  # file_storage/cw_k8s_ci_v0_state and re-sent every emit_interval, so they outlive
+  # both the log line and an agent restart.
+  #
+  # Escaping: these OTTL strings are YAML single-quoted (or block) scalars, so YAML
+  # keeps every backslash; OTTL then turns each \\ into the one backslash the regex
+  # needs. No pattern may contain a $, which the collector's confmap would expand.
+  # A pattern that does not match is an evaluation error: the fact is then omitted
+  # (optional), replaced (default_value), or the line is not used (required).
+  signal_to_info_metric/cw_k8s_ci_v0_vllm:
+    storage: file_storage/cw_k8s_ci_v0_state
+    emit_interval: {{ include "otel-container-insights.vllmInfoEmitInterval" . }}
+    max_state_bytes: {{ include "otel-container-insights.vllmInfoInt" (dict "name" "maxStateBytes" "value" .Values.otelContainerInsights.solutions.vllm.configInfo.maxStateBytes "min" 65536 "max" 67108864) }}
+    max_value_length: {{ include "otel-container-insights.vllmInfoInt" (dict "name" "maxValueLength" "value" .Values.otelContainerInsights.solutions.vllm.configInfo.maxValueLength "min" 1 "max" 1024) }}
+    # Emits the identity as the resource attribute cwagent.info.identity.k8s.pod.uid,
+    # which filter/cw_k8s_ci_v0_vllm_info_live checks against the live pod.
+    identity_output_prefix: cwagent.info.identity.
+    rules:
+      - name: vllm_engine_config_info
+        description: vLLM engine configuration parsed from the engine startup log line. The value is always 1.
+        # Plain substring match, no regex: the startup line of every vLLM version,
+        # from before the V0/V1 split ("an LLM engine") to the V1 engine.
+        body_contains:
+          - "Initializing an LLM engine (v"
+          - "Initializing a V0 LLM engine (v"
+          - "Initializing a V1 LLM engine (v"
+        identity: [k8s.pod.uid]
+        include_resource_attributes: [k8s.pod.name, k8s.namespace.name, k8s.container.name]
+        max_entities: {{ include "otel-container-insights.vllmInfoInt" (dict "name" "maxEntities" "value" .Values.otelContainerInsights.solutions.vllm.configInfo.maxEntities "min" 1 "max" 100000) }}
+        # A line that yields no vllm_version or model is not used. Every other fact is
+        # optional, because older vLLM versions do not log all of them.
+        attributes:
+          - key: vllm_version
+            value: 'ExtractPatterns(log.body, "Initializing an? (?:V[01] )?LLM engine \\(v(?P<v>[^)]+)\\) with config: ")["v"]'
+          # Block scalar: the pattern contains single quotes.
+          - key: model
+            value: |-
+              ExtractPatterns(log.body, "with config: model='(?P<v>[^']*)'")["v"]
+          # Lines from before the V0/V1 split read "Initializing an LLM engine": V0.
+          # (The connector rejects optional together with default_value.)
+          - key: vllm_engine
+            value: 'ExtractPatterns(log.body, "Initializing a (?P<v>V[01]) LLM engine")["v"]'
+            default_value: V0
+          - key: served_model_name
+            value: 'ExtractPatterns(log.body, ", served_model_name=(?P<v>[^,]+),")["v"]'
+            optional: true
+          - key: dtype
+            value: 'ExtractPatterns(log.body, ", dtype=(?:torch\\.)?(?P<v>[A-Za-z0-9_]+),")["v"]'
+            optional: true
+          - key: max_seq_len
+            value: 'ExtractPatterns(log.body, ", max_seq_len=(?P<v>\\d+),")["v"]'
+            optional: true
+          - key: tensor_parallel_size
+            value: 'ExtractPatterns(log.body, ", tensor_parallel_size=(?P<v>\\d+),")["v"]'
+            optional: true
+          - key: pipeline_parallel_size
+            value: 'ExtractPatterns(log.body, ", pipeline_parallel_size=(?P<v>\\d+),")["v"]'
+            optional: true
+          - key: data_parallel_size
+            value: 'ExtractPatterns(log.body, ", data_parallel_size=(?P<v>\\d+),")["v"]'
+            optional: true
+          - key: quantization
+            value: 'ExtractPatterns(log.body, ", quantization=(?P<v>[A-Za-z0-9_.\\-]+),")["v"]'
+            optional: true
+          - key: enforce_eager
+            value: 'ExtractPatterns(log.body, ", enforce_eager=(?P<v>True|False),")["v"]'
+            optional: true
+          - key: kv_cache_dtype
+            value: 'ExtractPatterns(log.body, ", kv_cache_dtype=(?P<v>[A-Za-z0-9_]+),")["v"]'
+            optional: true
+          - key: enable_prefix_caching
+            value: 'ExtractPatterns(log.body, ", enable_prefix_caching=(?P<v>True|False|None),")["v"]'
+            optional: true
+          # The method name, or "None" when the engine runs without speculative decoding.
+          # Block scalar: the pattern contains single quotes.
+          - key: speculative_method
+            value: |-
+              ExtractPatterns(log.body, "speculative_config=(?:SpeculativeConfig\\(method=')?(?P<v>None|[^',)]+)")["v"]
+            optional: true
+{{- end }}
+
 service:
   # Pin internal self-telemetry off. Without this the collector falls back to its
   # built-in default (metrics level Normal + a Prometheus reader on localhost:8888),
@@ -1091,6 +1259,9 @@ service:
 {{- if .Values.otelContainerInsights.logs.enabled }}
     - sigv4auth/cw_k8s_ci_v0_logs_dest
     - awscloudwatchlogsprovisioner/cw_k8s_ci_v0_logs
+{{- end }}
+{{- if $stateStorage }}
+    - file_storage/cw_k8s_ci_v0_state
 {{- end }}
   pipelines:
 {{- if .Values.nodeExporter.enabled }}
@@ -1223,7 +1394,11 @@ service:
 
 {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.vllm.enabled }}
     metrics/cw_k8s_ci_v0_vllm:
+      {{- if $configInfo }}
+      receivers: [prometheus/cw_k8s_ci_v0_vllm, signal_to_info_metric/cw_k8s_ci_v0_vllm]
+      {{- else }}
       receivers: [prometheus/cw_k8s_ci_v0_vllm]
+      {{- end }}
       processors:
         - filter/cw_k8s_ci_v0_scrape_metadata
         - filter/cw_k8s_ci_v0_vllm_keep
@@ -1232,6 +1407,11 @@ service:
         - transform/cw_k8s_ci_v0_set_cluster_name
         - transform/cw_k8s_ci_v0_vllm_promote
         - k8sattributes/cw_k8s_ci_v0_pod
+        {{- if $configInfo }}
+        # Right after k8sattributes adds the live pod's k8s.pod.uid.
+        - filter/cw_k8s_ci_v0_vllm_info_live
+        - transform/cw_k8s_ci_v0_vllm_info_cleanup
+        {{- end }}
         - transform/cw_k8s_ci_v0_set_node_name
         - transform/cw_k8s_ci_v0_promote_node_name
         - resourcedetection/cw_k8s_ci_v0
@@ -1311,11 +1491,21 @@ service:
       exporters:
         - otlphttp/cw_k8s_ci_v0_metrics_dest
 
-{{- if .Values.otelContainerInsights.logs.enabled }}
+{{- if $appLogs }}
     # ── CI Logs pipelines ──
+    # Ships application logs (logs.enabled), feeds the vLLM config Info metric
+    # connector (solutions.vllm.configInfo.enabled), or both. The connector takes the
+    # pod's k8s.pod.uid that k8sattributes/cw_k8s_ci_v0_pod adds.
     logs/cw_k8s_ci_v0_app:
       receivers: [filelog/cw_k8s_ci_v0_app]
       processors:
+        {{- if $infoOnlyLogs }}
+        # Logs-off mode: processors run per pipeline, so only what the connector
+        # needs. k8sattributes associates on the k8s.pod.name and k8s.namespace.name
+        # that the receiver parses from the file name, and adds k8s.pod.uid.
+        - filter/cw_k8s_ci_v0_vllm_info_prefilter
+        - k8sattributes/cw_k8s_ci_v0_pod
+        {{- else }}
         - transform/cw_k8s_ci_v0_logs_set_cluster_and_node
         - resourcedetection/cw_k8s_ci_v0
         - transform/cw_k8s_ci_v0_logs_set_cloud_resource_id
@@ -1325,8 +1515,16 @@ service:
         - transform/cw_k8s_ci_v0_logs_clear_schema_url
         - transform/cw_k8s_ci_v0_logs_set_workload
         - batch/cw_k8s_ci_v0_logs_dest
+        {{- end }}
       exporters:
+        {{- if $logs }}
         - otlphttp/cw_k8s_ci_v0_app_logs_dest
+        {{- end }}
+        {{- if $configInfo }}
+        - signal_to_info_metric/cw_k8s_ci_v0_vllm
+        {{- end }}
+{{- end }}
+{{- if $logs }}
 
     # ── CI Logs: Host pipeline ──
     # Intentionally omits k8sattributes/pod and set_workload — host logs
