@@ -99,9 +99,12 @@ The agent reads the three names from that file name, so it does not wait for the
 - When a pod is deleted, its series stops about 2 minutes later. The `k8sattributes` processor
   keeps a deleted pod for a grace period of 120 seconds. After that, the agent finds no pod with
   that name and drops the series.
-- When a StatefulSet replaces a pod, the new pod has the same name. Until the new engine logs
-  its startup line, the series shows the settings of the previous pod, with the UID of the new
-  pod. The startup line usually comes within seconds of the engine start.
+- When a StatefulSet replaces a pod, the new pod has the same name. Until the new engine starts
+  and logs its startup line, the series shows the settings of the previous pod, with the UID of
+  the new pod. This time includes the scheduling, the image pull, and the container start.
+- If the new pod with the same name never logs a vLLM startup line, the series keeps the
+  settings of the previous pod. For example, the container now runs another inference server,
+  or it fails before the engine starts. After the pod is deleted, the series stops.
 
 Caps, per agent:
 
@@ -131,8 +134,10 @@ settings that the agent already has survive the restart.
 With `otelContainerInsights.logs.enabled=false`, the agent still reads the pod logs on the
 node, but only for this metric. It uses only the engine startup line and ships no logs. In this
 mode the agent always keeps checkpoints in the storage. On its first start it reads the
-existing log files from the beginning, so it finds the engines that are already running. After
-a restart it continues from where it stopped.
+current log file of each container from the beginning. If the startup line of a running engine
+is still in the current file, the agent finds it. Kubelet rotates a log file at 10 MiB by default,
+and the agent does not read rotated files. After a restart the agent continues from where it
+stopped.
 
 Fargate has no node agent DaemonSet. So a vLLM pod on Fargate gets no Info metric.
 

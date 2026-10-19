@@ -336,9 +336,11 @@ receivers:
     {{- if $logs }}
     start_at: end
     {{- else }}
-    # No logs are shipped in this mode, only the vLLM engine startup line is used, so
-    # reading existing files from the start is safe; it finds the startup line of a
-    # vLLM pod that was already running. Checkpoints keep a restart from re-reading.
+    # No logs are shipped in this mode. Only the connector reads the records, so reading
+    # the current file of each container from the start is safe. It finds the startup
+    # line of a running vLLM engine if that line is still in the current file (kubelet
+    # rotates at 10 MiB, and rotated files are not read). Checkpoints keep a restart
+    # from rereading.
     start_at: beginning
     {{- end }}
     include_file_path: true
