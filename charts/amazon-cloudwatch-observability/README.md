@@ -68,6 +68,95 @@ runs `k8sattributes` pod association, so `k8s.workload.name` resolves to the own
 Deployment rather than to the ReplicaSet — whose pod-template hash likewise changes on
 every redeploy.
 
+### Engine configuration Info metric
+
+`vllm_engine_config_info` records how each vLLM engine was started. It is a gauge with the
+value 1. There is one series per vLLM container. So a pod with two vLLM containers gives two
+series. The engine's startup settings are labels on the series:
+
+- version: `vllm_version`, `vllm_engine`
+- model: `model`, `served_model_name`, `dtype`, `max_seq_len`, `quantization`, `kv_cache_dtype`
+- parallelism: `tensor_parallel_size`, `pipeline_parallel_size`, `data_parallel_size`
+- features: `enforce_eager`, `enable_prefix_caching`, `speculative_method`
+
+Older vLLM versions log fewer settings. If the startup line does not log a setting, its label
+is left out.
+
+It is off by default. Turn it on with `otelContainerInsights.solutions.vllm.configInfo.enabled=true`.
+It needs an agent image with the `signal_to_info_metric` connector. An older agent fails to
+start with it on.
+
+The agent on each node reads the engine startup line from the container's log. The line
+contains `Initializing ... LLM engine (v...)`. The agent sends each series again every
+`configInfo.emitInterval`.
+Empty means `otelContainerInsights.metricResolution`. The value is `<N>s`, `<N>m` or `<N>h`,
+from 1s to 24h.
+
+The agent identifies each series by the namespace, pod and container in the log file name.
+Kubelet writes each container log to `/var/log/containers/<pod>_<namespace>_<container>-<id>.log`.
+The agent reads the three names from that file name, so it does not wait for the Kubernetes API.
+
+- When a pod is deleted, its series stops about 2 minutes later. The `k8sattributes` processor
+  keeps a deleted pod for a grace period of 120 seconds. After that, the agent finds no pod with
+  that name and drops the series.
+- When a StatefulSet replaces a pod, the new pod has the same name. Until the new engine starts
+  and logs its startup line, the series shows the settings of the previous pod, with the UID of
+  the new pod. This time includes the scheduling, the image pull, and the container start.
+- If the new pod with the same name never logs a vLLM startup line, the series keeps the
+  settings of the previous pod. For example, the container now runs another inference server,
+  or it fails before the engine starts. After the pod is deleted, the series stops.
+
+Caps, per agent:
+
+- `maxEntities` (default 500): the number of vLLM containers tracked.
+- `maxStateBytes` (default 1048576): the size of the stored settings, in bytes.
+- `maxValueLength` (default 256): the length of each label value.
+
+The agent keeps the settings in `otelContainerInsights.stateStorage`, so they survive an agent
+restart. The Info metric turns the storage on by itself. The storage is a hostPath directory
+(`stateStorage.hostPath`, default `/var/lib/amazon-cloudwatch-agent/otel-state`). It is mounted
+read-write into the node agent DaemonSet only. The directory stays on the node after you
+uninstall the chart. One agent pod at a time locks the storage files. So the agent's
+`updateStrategy.rollingUpdate.maxSurge` must be 0, which is the DaemonSet default. The chart
+fails to render otherwise.
+
+The Info metric does not change log shipping. With logs on, the agent keeps no read positions
+(checkpoints) for the application log files by default. A restarted agent then starts at the
+end of each file, and the lines written while it was down are not shipped. To keep the
+checkpoints in the storage, set `otelContainerInsights.stateStorage.enabled=true`. A restarted
+agent then continues each file where it stopped.
+
+With logs on, the agent reads only the log lines written after it starts. If a vLLM pod
+already runs at the first agent start, its series starts after the pod's next restart.
+Without checkpoints, the same applies to a vLLM pod that starts while the agent is down. The
+settings that the agent already has survive the restart.
+
+With `otelContainerInsights.logs.enabled=false`, the agent still reads the pod logs on the
+node, but only for this metric. It uses only the engine startup line and ships no logs. In this
+mode the agent always keeps checkpoints in the storage. On its first start it reads the
+current log file of each container from the beginning. If the startup line of a running engine
+is still in the current file, the agent finds it. Kubelet rotates a log file at 10 MiB by default,
+and the agent does not read rotated files. After a restart the agent continues from where it
+stopped.
+
+Fargate has no node agent DaemonSet. So a vLLM pod on Fargate gets no Info metric.
+
+To add the engine settings to another vLLM metric, join on the pod:
+
+```promql
+sum by ("@resource.k8s.pod.uid") ({"vllm:num_requests_running"})
+  * on ("@resource.k8s.pod.uid") group_left (vllm_version, model)
+    max by ("@resource.k8s.pod.uid", vllm_version, model) (
+      last_over_time({"vllm_engine_config_info"}[2m])
+    )
+```
+
+Resource attributes are labels with the `@resource.` prefix. In the vLLM metrics pipeline, the
+`k8sattributes` processor adds `k8s.pod.uid` to both series. The agent sends no Info series
+without it. The pod UID is unique across clusters, and a replacement pod with the same name
+gets a new one. The `max by` keeps one series for each pod and set of settings. Use a
+`last_over_time` window longer than `emitInterval`.
+
 ## KServe control-plane metrics
 
 Set under `otelContainerInsights.solutions.kserve.controlPlane`, on by default. The
