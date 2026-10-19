@@ -174,7 +174,7 @@ spec:
   - mountPath: /var/log/pods
     name: criologs
     readOnly: true
-  {{- if and $.Values.otelContainerInsights.enabled (include "otel-container-insights.appLogsPipelineEnabled" $) (eq $agentName $.Values.otelContainerInsights.targetAgent) }}
+  {{- if and $.Values.otelContainerInsights.enabled $.Values.otelContainerInsights.logs.enabled (eq $agentName $.Values.otelContainerInsights.targetAgent) }}
   # /var/log covers the paths the OTEL log pipelines need: /var/log/containers/*.log
   # (app container logs), /var/log/messages, /var/log/dmesg, /var/log/secure
   # (host logs). The existing criologs mount on /var/log/pods is retained for
@@ -248,7 +248,7 @@ spec:
   - hostPath:
       path:  /var/log/pods
     name: criologs
-  {{- if and $.Values.otelContainerInsights.enabled (include "otel-container-insights.appLogsPipelineEnabled" $) (eq $agentName $.Values.otelContainerInsights.targetAgent) }}
+  {{- if and $.Values.otelContainerInsights.enabled $.Values.otelContainerInsights.logs.enabled (eq $agentName $.Values.otelContainerInsights.targetAgent) }}
   - hostPath:
       path: /var/log
     name: varlog

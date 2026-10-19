@@ -1212,7 +1212,7 @@ otelContainerInsights:
   ## not change log shipping. With logs.enabled false, the receiver that feeds the
   ## Info metric always keeps its checkpoints there.
   ## The storage files are locked by one agent pod at a time, so the agent's
-  ## updateStrategy.rollingUpdate.maxSurge must stay 0 (the DaemonSet default); the
+  ## updateStrategy.rollingUpdate.maxSurge must stay 0 (the DaemonSet default). The
   ## chart fails to render otherwise.
   stateStorage:
     enabled: false
@@ -1251,10 +1251,11 @@ otelContainerInsights:
       ## series per vLLM container, with the engine's startup configuration as attributes
       ## (vLLM version, model, engine, dtype, parallelism, quantization, ...). The agent's
       ## signal_to_info_metric connector parses it from the engine startup log line
-      ## inside the existing application-log and vLLM pipelines; it adds no pipeline
+      ## inside the existing application-log and vLLM pipelines. It adds no pipeline
       ## of its own.
       ## With otelContainerInsights.logs.enabled false, the application-log receiver
-      ## still runs, to feed the connector, and ships no logs.
+      ## still runs, to feed the connector, and ships no logs. It then reads the kubelet
+      ## log files in /var/log/pods, every 10s, or every emitInterval when that is shorter.
       ## Requires an agent image with the signal_to_info_metric connector: an older
       ## image fails to start when this is on. Turns on the otelContainerInsights.stateStorage
       ## extension and hostPath for its facts, but not the application-log checkpoints.

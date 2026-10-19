@@ -314,6 +314,7 @@ receivers:
 {{- if $appLogs }}
   # ── CI Logs receivers ──
   filelog/cw_k8s_ci_v0_app:
+    {{- if $logs }}
     include:
       - /var/log/containers/*.log
     exclude:
@@ -323,6 +324,22 @@ receivers:
       # FluentBit's existing Exclude_Path behavior.
       - /var/log/containers/aws-node*
       - /var/log/containers/kube-proxy*
+    {{- else }}
+    # Logs-off mode reads the kubelet's pod log files,
+    # /var/log/pods/<namespace>_<pod>_<uid>/<container>/<restart count>.log, so the
+    # path also gives the pod UID. These are the files that the /var/log/containers
+    # links point to (with the Docker runtime, they are links themselves). *.log skips
+    # the rotated files, as with logs on. The excludes are the logs-on ones: a pod name
+    # that starts with these words, in any namespace (a name has no underscore, and
+    # * does not match a /).
+    include:
+      - /var/log/pods/*/*/*.log
+    exclude:
+      - /var/log/pods/*_cloudwatch-agent*/*/*.log
+      - /var/log/pods/*_fluent-bit*/*/*.log
+      - /var/log/pods/*_aws-node*/*/*.log
+      - /var/log/pods/*_kube-proxy*/*/*.log
+    {{- end }}
     {{- if $appLogCheckpoints }}
     # File checkpoints persist in file_storage/cw_k8s_ci_v0_state, so a restarted
     # agent resumes each file where it stopped, including lines written while it was
@@ -342,16 +359,33 @@ receivers:
     # rotates at 10 MiB, and rotated files are not read). Checkpoints keep a restart
     # from rereading.
     start_at: beginning
+    # Only the startup lines matter in this mode, and the connector emits a new series
+    # as soon as it reads one. So polling every 10s (or every emit interval, when that
+    # is shorter) still gives the first series within the first emit interval, with
+    # fewer checkpoint writes and file stats than the 200ms default.
+    poll_interval: {{ include "otel-container-insights.vllmInfoLogsOffPollInterval" . }}
     {{- end }}
     include_file_path: true
     include_file_name: false
     max_concurrent_files: 100
     operators:
+      {{- if $logs }}
       - type: regex_parser
         id: extract_metadata_from_filepath
         regex: '^.*\/(?P<pod>[^_]+)_(?P<namespace>[^_]+)_(?P<container>.+)-[a-f0-9]{64}\.log$'
         parse_from: attributes["log.file.path"]
         parse_to: resource
+      {{- else }}
+      # One parse gives the three names and the pod UID. uid takes only the API UUID
+      # form. Any other directory suffix, such as the kubelet's config hash of a static
+      # pod (whose mirror pod has another UID in the API), leaves uid empty, and the
+      # connector stores no empty value, so that series has no UID check.
+      - type: regex_parser
+        id: extract_metadata_from_filepath
+        regex: '^/var/log/pods/(?P<namespace>[^_/]+)_(?P<pod>[^_/]+)_(?:(?P<uid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|[^/]+)/(?P<container>[^/]+)/[0-9]+\.log$'
+        parse_from: attributes["log.file.path"]
+        parse_to: resource
+      {{- end }}
       - type: move
         from: resource.pod
         to: resource["k8s.pod.name"]
@@ -361,6 +395,16 @@ receivers:
       - type: move
         from: resource.container
         to: resource["k8s.container.name"]
+      {{- if $infoOnlyLogs }}
+      # Empty when the parse found no UUID. A regex group that took no part in the
+      # match is an empty string, so this move does not fail when the parse worked.
+      # When the path does not match at all, on_error send_quiet keeps the errors
+      # logged to the ones of the logs-on chain (the parse and the three moves).
+      - type: move
+        from: resource.uid
+        to: resource["k8s.pod.uid"]
+        on_error: send_quiet
+      {{- end }}
       - id: parse_container_log
         type: container_log_parser
 {{- end }}
@@ -577,19 +621,43 @@ processors:
   {{- if $configInfo }}
 
   # The config Info metric is keyed on the namespace, pod and container that the
-  # app-log receiver parses from the log file name, so its resource carries those
-  # three and no pod UID. k8sattributes has just looked up the pod with that name in
-  # that namespace on this node and added its k8s.pod.uid. No UID means no such pod:
-  # it is gone (k8sattributes keeps a deleted pod for its 120 s grace period), so the
-  # facts are stale and the data point is dropped. While the pod cache syncs at agent
-  # start, a live pod can be missing too: the connector keeps the facts, and a later
-  # emit passes. The condition names the Info metric, so a scraped vllm:* or http_*
-  # series is never dropped, with or without a UID.
+  # app-log receiver parses from the log file name. Its resource also carries the
+  # k8s.pod.uid of the pod that logged the startup line, when the record had one.
+  # This sets that stored UID aside, so that k8sattributes/cw_k8s_ci_v0_pod (which
+  # never overwrites an attribute) adds the UID of the live pod with that name.
+  # No processor before this one sets or changes k8s.pod.uid on the Info metric.
+  # Each statement names the Info metric, whose resource holds no other metric.
+  transform/cw_k8s_ci_v0_vllm_info_uid:
+    error_mode: ignore
+    metric_statements:
+      - context: metric
+        statements:
+          - set(resource.attributes["cwagent.info.pod.uid"], resource.attributes["k8s.pod.uid"]) where metric.name == "vllm_engine_config_info" and resource.attributes["k8s.pod.uid"] != nil
+          - delete_key(resource.attributes, "k8s.pod.uid") where metric.name == "vllm_engine_config_info"
+
+  # Right after k8sattributes/cw_k8s_ci_v0_pod has looked up the pod with that name in
+  # that namespace on this node. An Info data point is stale, and dropped, when:
+  # - there is no live k8s.pod.uid: no such pod (k8sattributes keeps a deleted pod for
+  #   its 120 s grace period), or
+  # - the stored UID is set and is not the live one: a pod replaced under the same
+  #   name (a StatefulSet pod) that has not logged its own startup line yet.
+  # While the pod cache syncs at agent start, a live pod can be missing too: the
+  # connector keeps the facts, and a later emit passes. Each condition names the Info
+  # metric, so a scraped vllm:* or http_* series is never dropped, with or without a UID.
   filter/cw_k8s_ci_v0_vllm_info_live:
     error_mode: ignore
     metrics:
       datapoint:
         - 'metric.name == "vllm_engine_config_info" and resource.attributes["k8s.pod.uid"] == nil'
+        - 'metric.name == "vllm_engine_config_info" and resource.attributes["cwagent.info.pod.uid"] != nil and resource.attributes["cwagent.info.pod.uid"] != resource.attributes["k8s.pod.uid"]'
+
+  # The stored UID is private to the check above and is not sent.
+  transform/cw_k8s_ci_v0_vllm_info_cleanup:
+    error_mode: ignore
+    metric_statements:
+      - context: metric
+        statements:
+          - delete_key(resource.attributes, "cwagent.info.pod.uid") where metric.name == "vllm_engine_config_info"
   {{- end }}
   {{- end }}
 
@@ -1189,13 +1257,18 @@ connectors:
         # /var/log/containers/<pod>_<namespace>_<container>-<id>.log, which kubelet
         # creates and filelog/cw_k8s_ci_v0_app parses, so it is there in every mode
         # and does not wait for the k8sattributes pod cache. One series per container.
-        # A pod replaced under the same name (a StatefulSet pod) keeps the previous
-        # facts until its own startup line arrives, or until it is deleted if that line
-        # never comes. A deleted pod's series is dropped by
-        # filter/cw_k8s_ci_v0_vllm_info_live. The connector requires every identity key
-        # in include_resource_attributes.
+        # The connector requires every identity key in include_resource_attributes.
+        #
+        # k8s.pod.uid is the UID of the pod that logged the startup line: from
+        # k8sattributes/cw_k8s_ci_v0_pod with logs on, and from the /var/log/pods path
+        # in logs-off mode. A record without it stores no UID. A changed included value
+        # counts as changed facts, so a new pod's startup line replaces the stored UID.
+        # filter/cw_k8s_ci_v0_vllm_info_live drops the series while the stored UID is
+        # not the UID of the live pod with that name: a pod replaced under the same name
+        # (a StatefulSet pod) has no series until its own startup line arrives. It also
+        # drops the series of a deleted pod.
         identity: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
-        include_resource_attributes: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
+        include_resource_attributes: [k8s.namespace.name, k8s.pod.name, k8s.container.name, k8s.pod.uid]
         max_entities: {{ include "otel-container-insights.vllmInfoInt" (dict "name" "maxEntities" "value" .Values.otelContainerInsights.solutions.vllm.configInfo.maxEntities "min" 1 "max" 100000) }}
         # A line that yields no vllm_version or model is not used. Every other fact is
         # optional, because older vLLM versions do not log all of them.
@@ -1408,10 +1481,16 @@ service:
         - metricstarttime/cw_k8s_ci_v0
         - transform/cw_k8s_ci_v0_set_cluster_name
         - transform/cw_k8s_ci_v0_vllm_promote
+        {{- if $configInfo }}
+        # Sets the Info metric's stored pod UID aside, so k8sattributes adds the live one.
+        - transform/cw_k8s_ci_v0_vllm_info_uid
+        {{- end }}
         - k8sattributes/cw_k8s_ci_v0_pod
         {{- if $configInfo }}
-        # Right after k8sattributes adds the live pod's k8s.pod.uid.
+        # Right after k8sattributes adds the live pod's k8s.pod.uid: drop stale Info
+        # data points, then remove the stored UID.
         - filter/cw_k8s_ci_v0_vllm_info_live
+        - transform/cw_k8s_ci_v0_vllm_info_cleanup
         {{- end }}
         - transform/cw_k8s_ci_v0_set_node_name
         - transform/cw_k8s_ci_v0_promote_node_name
@@ -1497,7 +1576,9 @@ service:
     # Ships application logs (logs.enabled), feeds the vLLM config Info metric
     # connector (solutions.vllm.configInfo.enabled), or both. The connector keys on the
     # k8s.namespace.name, k8s.pod.name and k8s.container.name that the receiver parses
-    # from the log file name, so it needs none of the processors.
+    # from the log file name. It also stores k8s.pod.uid: with logs on, the
+    # k8sattributes/cw_k8s_ci_v0_pod of this chain adds it, and in logs-off mode the
+    # receiver parses it from the /var/log/pods path.
     #
     # Logs-off mode has no processors: every record goes straight to the connector.
     # Its body_contains check is cheap (about 76 ns and no allocations per record),

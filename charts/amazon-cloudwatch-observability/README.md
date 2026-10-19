@@ -92,19 +92,31 @@ contains `Initializing ... LLM engine (v...)`. The agent sends each series again
 Empty means `otelContainerInsights.metricResolution`. The value is `<N>s`, `<N>m` or `<N>h`,
 from 1s to 24h.
 
-The agent identifies each series by the namespace, pod and container in the log file name.
-Kubelet writes each container log to `/var/log/containers/<pod>_<namespace>_<container>-<id>.log`.
-The agent reads the three names from that file name, so it does not wait for the Kubernetes API.
+The agent identifies each series by the namespace, pod and container in the log file path, so
+it does not wait for the Kubernetes API. With logs on, the agent reads the container logs in
+`/var/log/containers/<pod>_<namespace>_<container>-<id>.log`. With
+`otelContainerInsights.logs.enabled=false`, it reads the same logs in the files that kubelet
+writes, `/var/log/pods/<namespace>_<pod>_<uid>/<container>/<n>.log`.
 
+The agent also keeps the UID of the pod that logged the startup line. Each time it sends a
+series, it finds the live pod with that name and compares the two UIDs:
+
+- When a StatefulSet replaces a pod, the new pod has the same name and a new UID. The pod has
+  no series until its own engine logs its startup line. Then the series shows the settings of
+  the new pod. This time includes the scheduling, the image pull, and the container start.
+- If the new pod with the same name never logs a vLLM startup line, it has no series. For
+  example, the container now runs another inference server, or it fails before the engine
+  starts.
 - When a pod is deleted, its series stops about 2 minutes later. The `k8sattributes` processor
   keeps a deleted pod for a grace period of 120 seconds. After that, the agent finds no pod with
   that name and drops the series.
-- When a StatefulSet replaces a pod, the new pod has the same name. Until the new engine starts
-  and logs its startup line, the series shows the settings of the previous pod, with the UID of
-  the new pod. This time includes the scheduling, the image pull, and the container start.
-- If the new pod with the same name never logs a vLLM startup line, the series keeps the
-  settings of the previous pod. For example, the container now runs another inference server,
-  or it fails before the engine starts. After the pod is deleted, the series stops.
+
+With logs on, the `k8sattributes` processor of the log pipeline adds the UID to the startup
+line. When the agent starts, the processor loads its pod cache from the Kubernetes API. If the
+cache has no UID for a startup line, that series has no UID check until the next startup line of
+the container. With logs off, the agent reads the UID from the `/var/log/pods` path. A static
+pod then has no UID check. Kubelet starts a static pod from a file on the node, and its log
+directory does not have the pod UID from the Kubernetes API.
 
 Caps, per agent:
 
@@ -137,7 +149,10 @@ mode the agent always keeps checkpoints in the storage. On its first start it re
 current log file of each container from the beginning. If the startup line of a running engine
 is still in the current file, the agent finds it. Kubelet rotates a log file at 10 MiB by default,
 and the agent does not read rotated files. After a restart the agent continues from where it
-stopped.
+stopped. In this mode the agent checks the log files every 10 seconds. If `emitInterval` is
+shorter, the agent checks them every `emitInterval`. The agent sends a new series as soon as it
+reads the startup line. So the series starts within one `emitInterval` after the engine writes
+the line.
 
 Fargate has no node agent DaemonSet. So a vLLM pod on Fargate gets no Info metric.
 
@@ -152,10 +167,11 @@ sum by ("@resource.k8s.pod.uid") ({"vllm:num_requests_running"})
 ```
 
 Resource attributes are labels with the `@resource.` prefix. In the vLLM metrics pipeline, the
-`k8sattributes` processor adds `k8s.pod.uid` to both series. The agent sends no Info series
-without it. The pod UID is unique across clusters, and a replacement pod with the same name
-gets a new one. The `max by` keeps one series for each pod and set of settings. Use a
-`last_over_time` window longer than `emitInterval`.
+`k8sattributes` processor adds the UID of the live pod, `k8s.pod.uid`, to both series. The agent
+sends no Info series without it. Except for the series without a UID check, it also sends no
+Info series with the settings of a previous pod with the same name. The pod UID is unique across
+clusters, and a replacement pod with the same name gets a new one. The `max by` keeps one series
+for each pod and set of settings. Use a `last_over_time` window longer than `emitInterval`.
 
 ## KServe control-plane metrics
 

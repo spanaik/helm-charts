@@ -493,15 +493,39 @@ within the connector's 1s..24h bounds, so a bad value fails here rather than at 
   {{- $source = "otelContainerInsights.metricResolution (used because solutions.vllm.configInfo.emitInterval is empty)" -}}
   {{- $raw = .Values.otelContainerInsights.metricResolution | toString -}}
 {{- end -}}
-{{- $seconds := 0 -}}
-{{- if regexMatch "^[0-9]+[smh]$" $raw -}}
-  {{- $unit := regexFind "[smh]$" $raw -}}
-  {{- $seconds = mul (trimSuffix $unit $raw | int64) (get (dict "s" 1 "m" 60 "h" 3600) $unit) -}}
-{{- end -}}
+{{- $seconds := include "otel-container-insights.durationSeconds" $raw | int64 -}}
 {{- if or (lt $seconds 1) (gt $seconds 86400) -}}
   {{- fail (printf "%s must be a duration in \"<N>s\", \"<N>m\" or \"<N>h\" format between 1s and 24h (e.g. \"60s\", \"5m\", \"1h\"), got: %s" $source $raw) -}}
 {{- end -}}
 {{- $raw -}}
+{{- end -}}
+
+{{/*
+The number of seconds in a "<N>s", "<N>m" or "<N>h" duration string, 0 for any other string.
+*/}}
+{{- define "otel-container-insights.durationSeconds" -}}
+{{- $seconds := 0 -}}
+{{- if regexMatch "^[0-9]+[smh]$" . -}}
+  {{- $unit := regexFind "[smh]$" . -}}
+  {{- $seconds = mul (trimSuffix $unit . | int64) (get (dict "s" 1 "m" 60 "h" 3600) $unit) -}}
+{{- end -}}
+{{- $seconds -}}
+{{- end -}}
+
+{{/*
+poll_interval of filelog/cw_k8s_ci_v0_app in logs-off mode (configInfo on, logs.enabled off):
+10s, or the emit interval of the vLLM config Info metric (otel-container-insights.vllmInfoEmitInterval)
+when that is shorter. The connector emits a new entity as soon as it reads the startup line, so
+the first series still comes within the first emit interval after the line is written. Polling
+less often than the receiver default of 200ms cuts the checkpoint writes and the file stats.
+*/}}
+{{- define "otel-container-insights.vllmInfoLogsOffPollInterval" -}}
+{{- $emit := include "otel-container-insights.vllmInfoEmitInterval" . -}}
+{{- if lt (include "otel-container-insights.durationSeconds" $emit | int64) 10 -}}
+{{- $emit -}}
+{{- else -}}
+10s
+{{- end -}}
 {{- end -}}
 
 {{/*

@@ -17,12 +17,17 @@
 #   2. No new pipeline: the connector is a second exporter of logs/cw_k8s_ci_v0_app
 #      and a second receiver of metrics/cw_k8s_ci_v0_vllm.
 #   3. Logs-off mode (configInfo on, logs.enabled off): the app-log pipeline runs only
-#      to feed the connector, ships nothing, and has no processors. In every mode,
+#      to feed the connector, ships nothing, and has no processors. Its receiver reads
+#      the kubelet's /var/log/pods files (the same containers as /var/log/containers
+#      with logs on), parses the names and the pod UID from that path in one regex, and
+#      polls every 10s (or every emit interval, when that is shorter). In every mode,
 #      every defined component is used and every used component is defined.
 #   4. Identity: the connector keys on the namespace, pod and container that the
-#      app-log receiver parses from the log file name. Right after k8sattributes,
-#      the Info metric of a pod that k8sattributes cannot find (no k8s.pod.uid) is
-#      dropped. No scraped vllm:* or http_* series is ever dropped.
+#      app-log receiver parses from the log file name, and also stores the k8s.pod.uid
+#      of the record. Before k8sattributes, that stored UID is set aside. Right after
+#      it, the Info metric is dropped when the live pod has no UID (it is gone) or a
+#      UID other than the stored one (a pod replaced under the same name), then the
+#      stored UID is removed. No scraped vllm:* or http_* series is ever dropped.
 #   5. Storage: one file_storage extension, a writable hostPath on the node agent
 #      DaemonSet only, and maxSurge 0. configInfo does not change log shipping: with
 #      logs on, the app-log receiver checkpoints only with stateStorage.enabled. In
@@ -87,6 +92,11 @@ render "$CHART_DIR" storage_only_logs_off "${OTEL[@]}" "${LOGS_OFF[@]}" "${STORA
 render "$CHART_DIR" emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.metricResolution=20s
 render "$CHART_DIR" emit_15s "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=15s
 render "$CHART_DIR" emit_1h "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=1h
+# The logs-off poll interval: min(10s, effective emit interval).
+render "$CHART_DIR" poll_emit_5s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=5s
+render "$CHART_DIR" poll_emit_2m "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=2m
+render "$CHART_DIR" poll_resolution_8s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.metricResolution=8s
+render "$CHART_DIR" poll_emit_5s_logs_on "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=5s
 for bad in 15 0s 25h 1m30s abc; do
     render "$CHART_DIR" "emit_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" --set "otelContainerInsights.solutions.vllm.configInfo.emitInterval=${bad}"
 done
@@ -126,6 +136,7 @@ if [[ -n "$BASE_REF" ]]; then
 fi
 
 python3 - "${TMP_DIR}" "${BASE_REF}" "${BASE_STATUS}" <<'PY'
+import json
 import os
 import re
 import sys
@@ -146,20 +157,35 @@ VLLM_PIPELINE = "metrics/cw_k8s_ci_v0_vllm"
 VLLM_RECEIVER = "prometheus/cw_k8s_ci_v0_vllm"
 KEEP = "filter/cw_k8s_ci_v0_vllm_keep"
 POD = "k8sattributes/cw_k8s_ci_v0_pod"
+UID_SET_ASIDE = "transform/cw_k8s_ci_v0_vllm_info_uid"
 LIVE = "filter/cw_k8s_ci_v0_vllm_info_live"
 CLEANUP = "transform/cw_k8s_ci_v0_vllm_info_cleanup"
 PREFILTER = "filter/cw_k8s_ci_v0_vllm_info_prefilter"
+INFO_PROCESSORS = (UID_SET_ASIDE, LIVE, CLEANUP)
 INFO_METRIC = "vllm_engine_config_info"
+# The private resource attribute that holds the stored UID between the transforms.
+STORED_UID = "cwagent.info.pod.uid"
 # The connector matches the startup line by plain substrings, no regex.
 BODY_CONTAINS = ["Initializing an LLM engine (v", "Initializing a V0 LLM engine (v",
                  "Initializing a V1 LLM engine (v"]
 # The connector's identity: what the app-log receiver parses from the log file name.
 IDENTITY = ["k8s.namespace.name", "k8s.pod.name", "k8s.container.name"]
+# Copied to the emitted resource: the identity and the UID of the pod that logged the line.
+INCLUDED = IDENTITY + ["k8s.pod.uid"]
+# Logs-off mode: the receiver reads /var/log/pods/<namespace>_<pod>_<uid>/<container>/<n>.log.
+PODS_INCLUDE = ["/var/log/pods/*/*/*.log"]
+PODS_EXCLUDE = [f"/var/log/pods/*_{p}*/*/*.log" for p in ("cloudwatch-agent", "fluent-bit", "aws-node", "kube-proxy")]
+PODS_REGEX = (r"^/var/log/pods/(?P<namespace>[^_/]+)_(?P<pod>[^_/]+)_(?:(?P<uid>[0-9a-f]{8}-[0-9a-f]{4}"
+              r"-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|[^/]+)/(?P<container>[^/]+)/[0-9]+\.log$")
+PODS_PARSER = {"type": "regex_parser", "id": "extract_metadata_from_filepath", "regex": PODS_REGEX,
+               "parse_from": 'attributes["log.file.path"]', "parse_to": "resource"}
+UID_MOVE = {"type": "move", "from": "resource.uid", "to": 'resource["k8s.pod.uid"]', "on_error": "send_quiet"}
 # Every mode the checks below look at, for the component cross-checks.
 MODES = ("default", "logs_on", "logs_off", "logs_on_tuned", "info_logs_on", "info_logs_off",
          "info_storage_logs_on", "info_storage_logs_off", "storage_only", "storage_only_logs_off",
          "vllm_off", "info_vllm_off", "info_otel_off", "emit_metric_resolution", "emit_15s",
-         "emit_1h", "surge_on_delete")
+         "emit_1h", "poll_emit_5s", "poll_emit_2m", "poll_resolution_8s", "poll_emit_5s_logs_on",
+         "surge_on_delete")
 
 GREEN, RED, YELLOW, RESET = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
 passed = failed = 0
@@ -283,8 +309,21 @@ def file_name_attributes(cfg, file_path):
         src = re.fullmatch(r"resource\.(\w+)", o.get("from") or "")
         dst = re.fullmatch(r'resource\["([^"]+)"\]', o.get("to") or "")
         if src and dst and src.group(1) in m.groupdict():
-            out[dst.group(1)] = m.group(src.group(1))
+            # Go gives "" for a group that took no part in the match, Python gives None.
+            out[dst.group(1)] = m.group(src.group(1)) or ""
     return out
+
+
+def glob_match(pattern, path):
+    """doublestar.PathMatch, as the file matcher applies include and exclude, for the globs
+    used here: * matches any run of characters other than /."""
+    return re.fullmatch("".join("[^/]*" if c == "*" else re.escape(c) for c in pattern), path) is not None
+
+
+def selects(receiver, path):
+    """True if the receiver's include and exclude globs select path."""
+    return (any(glob_match(g, path) for g in receiver.get("include") or []) and
+            not any(glob_match(g, path) for g in receiver.get("exclude") or []))
 
 
 def mentions(cfg, component):
@@ -421,7 +460,7 @@ check("maxSurge 1 renders while the storage is off", rc("logs_on_surge") == 0)
 for name in ("default", "logs_on", "logs_off", "info_vllm_off", "info_otel_off"):
     everything = [otel_config(name, a) for a in agent_crs(name)]
     check(f"{name}: no connector, storage extension or Info metric processors",
-          not any(mentions(c, x) for c in everything for x in (CONNECTOR, STORAGE, LIVE, CLEANUP, PREFILTER)))
+          not any(mentions(c, x) for c in everything for x in (CONNECTOR, STORAGE, PREFILTER) + INFO_PROCESSORS))
     check(f"{name}: no state volume on any agent",
           not any(volumes(cr, "otelstate") or mounts(cr, "otelstate") for cr in agent_crs(name).values()))
 check("configInfo without the vLLM solution renders as if it were off",
@@ -444,7 +483,9 @@ check(f"{VLLM_PIPELINE} keeps its scrape receiver first",
       pipeline(on, VLLM_PIPELINE).get("receivers") == [VLLM_RECEIVER, CONNECTOR])
 check(f"{APP_PIPELINE} processors are unchanged",
       pipeline(on, APP_PIPELINE).get("processors") == pipeline(off, APP_PIPELINE).get("processors"))
-check(f"no {PREFILTER} and no {CLEANUP}", not mentions(on, PREFILTER) and not mentions(on, CLEANUP))
+check(f"{APP_PIPELINE} runs {POD} before the connector, which adds the k8s.pod.uid the connector stores",
+      POD in (pipeline(on, APP_PIPELINE).get("processors") or []))
+check(f"no {PREFILTER}", not mentions(on, PREFILTER))
 
 connector = section(on, "connectors").get(CONNECTOR) or {}
 rules = connector.get("rules") or [{}]
@@ -455,8 +496,8 @@ check("max_state_bytes and max_value_length come from values",
       connector.get("max_state_bytes") == 1048576 and connector.get("max_value_length") == 256)
 check(f"one rule, {INFO_METRIC}, with max_entities 500",
       len(rules) == 1 and rule.get("name") == INFO_METRIC and rule.get("max_entities") == 500)
-check(f"the rule is keyed on {IDENTITY} and copies the same three to the resource",
-      rule.get("identity") == IDENTITY and rule.get("include_resource_attributes") == IDENTITY)
+check(f"the rule is keyed on {IDENTITY} and copies those three and k8s.pod.uid to the resource",
+      rule.get("identity") == IDENTITY and rule.get("include_resource_attributes") == INCLUDED)
 check("no identity_output_prefix (the identity keys are plain resource attributes)",
       "identity_output_prefix" not in connector)
 check("the startup line is matched by the three body_contains substrings, with no OTTL condition",
@@ -516,21 +557,44 @@ check(f"configInfo does not change log shipping: {APP_RECEIVER} (no checkpoints,
       section(on, "receivers").get(APP_RECEIVER) == section(off, "receivers").get(APP_RECEIVER) and
       "storage" not in (section(on, "receivers").get(APP_RECEIVER) or {"storage": 1}) and
       section(on, "exporters").get(APP_EXPORTER) == section(off, "exporters").get(APP_EXPORTER))
+on_receiver = section(on, "receivers").get(APP_RECEIVER) or {}
+check(f"logs on: {APP_RECEIVER} reads /var/log/containers, with no poll_interval and no k8s.pod.uid move",
+      on_receiver.get("include") == ["/var/log/containers/*.log"] and "poll_interval" not in on_receiver and
+      "include_file_path_resolved" not in on_receiver and
+      not any(o.get("from") == "resource.uid" for o in on_receiver.get("operators") or []))
 
 # 4. Identity and liveness.
-SAMPLE_PATH = "/var/log/containers/vllm-0_ml-serving_vllm-server-" + "0123456789abcdef" * 4 + ".log"
+SAMPLE_UID = "5f2c8a1e-3b4d-4e6f-9a0b-1c2d3e4f5a6b"
+SAMPLE_PATHS = {"info_logs_on": "/var/log/containers/vllm-0_ml-serving_vllm-server-" + "0123456789abcdef" * 4 + ".log",
+                "info_logs_off": f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log"}
 SAMPLE_IDENTITY = {"k8s.pod.name": "vllm-0", "k8s.namespace.name": "ml-serving",
                    "k8s.container.name": "vllm-server"}
-for name in ("info_logs_on", "info_logs_off"):
-    got = file_name_attributes(otel_config(name), SAMPLE_PATH)
+for name, sample_path in SAMPLE_PATHS.items():
+    got = file_name_attributes(otel_config(name), sample_path)
     if not check(f"{name}: {APP_RECEIVER} sets every identity key from the log file name",
                  {k: got.get(k) for k in IDENTITY} == SAMPLE_IDENTITY):
         print(f"    got {got}")
 chain = pipeline(on, VLLM_PIPELINE).get("processors") or []
 pod_at = chain.index(POD) if POD in chain else -1
-check(f"{LIVE} follows {POD} directly", pod_at >= 0 and chain[pod_at + 1:pod_at + 2] == [LIVE])
-check(f"apart from {LIVE}, {VLLM_PIPELINE} processors are unchanged",
-      [p for p in chain if p != LIVE] == pipeline(off, VLLM_PIPELINE).get("processors"))
+check(f"{UID_SET_ASIDE} runs right before {POD}, and {LIVE} then {CLEANUP} right after it",
+      pod_at >= 1 and chain[pod_at - 1:pod_at + 3] == [UID_SET_ASIDE, POD, LIVE, CLEANUP])
+check(f"{UID_SET_ASIDE} runs after {KEEP}", KEEP in chain and chain.index(KEEP) < pod_at - 1)
+check(f"apart from {', '.join(INFO_PROCESSORS)}, {VLLM_PIPELINE} processors are unchanged",
+      [p for p in chain if p not in INFO_PROCESSORS] == pipeline(off, VLLM_PIPELINE).get("processors"))
+before_uid = chain[:max(pod_at - 1, 0)]
+check(f"no processor before {UID_SET_ASIDE} names k8s.pod.uid, so none sets or changes it on the Info metric",
+      bool(before_uid) and all(p in section(on, "processors") for p in before_uid) and
+      not any("k8s.pod.uid" in json.dumps(section(on, "processors").get(p)) for p in before_uid))
+uid_proc = section(on, "processors").get(UID_SET_ASIDE) or {}
+check(f"{UID_SET_ASIDE} copies k8s.pod.uid to {STORED_UID} and deletes it, for {INFO_METRIC} only",
+      uid_proc == {"error_mode": "ignore", "metric_statements": [{"context": "metric", "statements": [
+          f'set(resource.attributes["{STORED_UID}"], resource.attributes["k8s.pod.uid"]) '
+          f'where metric.name == "{INFO_METRIC}" and resource.attributes["k8s.pod.uid"] != nil',
+          f'delete_key(resource.attributes, "k8s.pod.uid") where metric.name == "{INFO_METRIC}"']}]})
+cleanup = section(on, "processors").get(CLEANUP) or {}
+check(f"{CLEANUP} deletes {STORED_UID}, for {INFO_METRIC} only",
+      cleanup == {"error_mode": "ignore", "metric_statements": [{"context": "metric", "statements": [
+          f'delete_key(resource.attributes, "{STORED_UID}") where metric.name == "{INFO_METRIC}"']}]})
 pod_proc = section(on, "processors").get(POD) or {}
 associations = [[(s.get("from"), s.get("name")) for s in a.get("sources") or []]
                 for a in pod_proc.get("pod_association") or []]
@@ -541,14 +605,21 @@ check(f"{POD} adds k8s.pod.uid, looked up by the k8s.pod.name and k8s.namespace.
       {"k8s.pod.name", "k8s.namespace.name"} <= set(rule.get("include_resource_attributes") or []))
 live = section(on, "processors").get(LIVE) or {}
 live_conditions = ((live.get("metrics") or {}).get("datapoint")) or []
-check(f"{LIVE} drops a {INFO_METRIC} data point that has no k8s.pod.uid",
+check(f"{LIVE} drops a {INFO_METRIC} data point with no live k8s.pod.uid, or with a stored "
+      f"{STORED_UID} that is not the live k8s.pod.uid",
       live.get("error_mode") == "ignore" and set(live) == {"error_mode", "metrics"} and
       set(live.get("metrics") or {}) == {"datapoint"} and live_conditions == [
-          f'metric.name == "{INFO_METRIC}" and resource.attributes["k8s.pod.uid"] == nil'])
+          f'metric.name == "{INFO_METRIC}" and resource.attributes["k8s.pod.uid"] == nil',
+          f'metric.name == "{INFO_METRIC}" and resource.attributes["{STORED_UID}"] != nil and '
+          f'resource.attributes["{STORED_UID}"] != resource.attributes["k8s.pod.uid"]'])
 check(f"{LIVE} never drops a scraped series: each condition is an 'and' that names {INFO_METRIC}, "
       "which is not a vllm:* or http_* name",
       bool(live_conditions) and not re.match(r"^(vllm:|http_)", INFO_METRIC) and
       all(" or " not in c and f'metric.name == "{INFO_METRIC}"' in c.split(" and ") for c in live_conditions))
+info_ottl = (live_conditions + [s for p in (uid_proc, cleanup) for g in p.get("metric_statements") or []
+                                for s in g.get("statements") or []])
+check("no OTTL of the Info metric processors contains a $ (the collector's confmap would expand it)",
+      len(info_ottl) == 5 and all("$" not in s for s in info_ottl))
 
 keep_on = ((section(on, "processors").get(KEEP) or {}).get("metrics") or {}).get("metric") or []
 keep_off = ((section(off, "processors").get(KEEP) or {}).get("metrics") or {}).get("metric") or []
@@ -581,16 +652,71 @@ check(f"the only pipeline added to the logs-off render is {APP_PIPELINE}",
       set(pipelines(lo)) == set(pipelines(lo_base)) | {APP_PIPELINE} and APP_PIPELINE not in pipelines(lo_base))
 check(f"{APP_PIPELINE} is {APP_RECEIVER} straight to the connector, with no processors",
       pipeline(lo, APP_PIPELINE) == {"receivers": [APP_RECEIVER], "exporters": [CONNECTOR]})
-check(f"no {PREFILTER} and no {CLEANUP} defined", not mentions(lo, PREFILTER) and not mentions(lo, CLEANUP))
+check(f"no {PREFILTER} defined", not mentions(lo, PREFILTER))
 check("the log-shipping processors are not defined",
       not any(x.startswith(("transform/cw_k8s_ci_v0_logs_", "batch/cw_k8s_ci_v0_logs_"))
               for x in section(lo, "processors")))
-check(f"{VLLM_PIPELINE} and {LIVE} are as with logs on",
+check(f"{VLLM_PIPELINE} and {', '.join(INFO_PROCESSORS)} are as with logs on",
       pipeline(lo, VLLM_PIPELINE) == pipeline(on, VLLM_PIPELINE) and
-      section(lo, "processors").get(LIVE) == section(on, "processors").get(LIVE))
+      all(x in section(lo, "processors") and section(lo, "processors").get(x) == section(on, "processors").get(x)
+          for x in INFO_PROCESSORS))
 check("the connector is the same as with logs on", section(lo, "connectors") == section(on, "connectors"))
 lo_receiver = section(lo, "receivers").get(APP_RECEIVER) or {}
 check(f"{APP_RECEIVER} starts at the beginning (nothing is shipped)", lo_receiver.get("start_at") == "beginning")
+check(f"{APP_RECEIVER} polls every 10s (emitInterval 30s, the default)", lo_receiver.get("poll_interval") == "10s")
+check(f"{APP_RECEIVER} reads /var/log/pods with the logs-on excludes in that layout, and no "
+      "include_file_path_resolved",
+      lo_receiver.get("include") == PODS_INCLUDE and lo_receiver.get("exclude") == PODS_EXCLUDE and
+      "include_file_path_resolved" not in lo_receiver and
+      all(lo_receiver.get(k) == on_receiver.get(k) for k in
+          ("include_file_path", "include_file_name", "max_concurrent_files")))
+on_ops, lo_ops = on_receiver.get("operators") or [], lo_receiver.get("operators") or []
+check(f"{APP_RECEIVER} operators: one /var/log/pods regex_parser, the three logs-on moves, the uid move, "
+      "then container_log_parser, with no if guard",
+      len(on_ops) == 5 and on_ops[-1].get("type") == "container_log_parser" and
+      lo_ops == [PODS_PARSER] + on_ops[1:4] + [UID_MOVE] + on_ops[4:] and not any("if" in o for o in lo_ops))
+# The same containers in both layouts: (namespace, pod, container) -> selected by the excludes?
+CONTAINER_ID = "0123456789abcdef" * 4
+SAMPLE_PODS = (
+    ("amazon-cloudwatch", "cloudwatch-agent-x7k2p", "otc-container", False),
+    ("amazon-cloudwatch", "cloudwatch-agent-cluster-scraper-5d9f-abcde", "otc-container", False),
+    ("amazon-cloudwatch", "fluent-bit-9qz8w", "fluent-bit", False),
+    ("kube-system", "aws-node-4xk2l", "aws-node", False),
+    ("kube-system", "aws-node-4xk2l", "aws-eks-nodeagent", False),
+    ("kube-system", "kube-proxy-p8s7d", "kube-proxy", False),
+    ("ml-serving", "vllm-0", "vllm-server", True),
+    ("cloudwatch-agent-test", "foo", "app", True),
+    ("ml-serving", "my-cloudwatch-agent-1", "app", True),
+    ("ml-serving", "app-0", "cloudwatch-agent", True),
+    ("amazon-cloudwatch", "amazon-cloudwatch-observability-controller-manager-1", "manager", True))
+for ns, pod, container, want in SAMPLE_PODS:
+    pods_path = f"/var/log/pods/{ns}_{pod}_{SAMPLE_UID}/{container}/0.log"
+    containers_path = f"/var/log/containers/{pod}_{ns}_{container}-{CONTAINER_ID}.log"
+    check(f"{ns}/{pod}/{container}: {'read' if want else 'excluded'} in both layouts",
+          selects(lo_receiver, pods_path) == want and selects(on_receiver, containers_path) == want)
+check("rotated and compressed files are not read",
+      not selects(lo_receiver, f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log.20261019-120000") and
+      not selects(lo_receiver, f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log.20261018-1.gz"))
+for desc, pods_path, want in (
+        ("kubelet pod log", f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log",
+         {"k8s.namespace.name": "ml-serving", "k8s.pod.name": "vllm-0", "k8s.container.name": "vllm-server",
+          "k8s.pod.uid": SAMPLE_UID}),
+        ("kubelet pod log after 12 container restarts",
+         f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/12.log",
+         {"k8s.namespace.name": "ml-serving", "k8s.pod.name": "vllm-0", "k8s.container.name": "vllm-server",
+          "k8s.pod.uid": SAMPLE_UID}),
+        ("static pod, kubelet config hash: names, empty UID (no UID check)",
+         "/var/log/pods/kube-system_vllm-static-node1_0123456789abcdef0123456789abcdef/vllm/0.log",
+         {"k8s.namespace.name": "kube-system", "k8s.pod.name": "vllm-static-node1", "k8s.container.name": "vllm",
+          "k8s.pod.uid": ""}),
+        ("rotated file name: no match, as today's regex on a non-matching name",
+         f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log.20261019-120000", {}),
+        ("a /var/log/containers name: no match", SAMPLE_PATHS["info_logs_on"], {})):
+    got = file_name_attributes(lo, pods_path)
+    if not check(f"pods path, {desc}", got == want):
+        print(f"    got {got!r}")
+check("the pods regex has no $ other than its end anchor (the collector's confmap expands ${...})",
+      PODS_REGEX.count("$") == 1 and PODS_REGEX.endswith("$"))
 check(f"no {APP_EXPORTER}, host-log pipeline, or logs auth extensions",
       APP_EXPORTER not in section(lo, "exporters") and "logs/cw_k8s_ci_v0_node" not in pipelines(lo) and
       "filelog/cw_k8s_ci_v0_node" not in section(lo, "receivers") and
@@ -599,12 +725,34 @@ check(f"no {APP_EXPORTER}, host-log pipeline, or logs auth extensions",
 check("no exporter other than the metrics destination", list(section(lo, "exporters")) == ["otlphttp/cw_k8s_ci_v0_metrics_dest"])
 lo_crs = agent_crs("info_logs_off")
 lo_node = lo_crs.get(AGENT) or {"spec": {}}
-check("/var/log is mounted read-only on the node agent",
-      [(m.get("mountPath"), m.get("readOnly")) for m in mounts(lo_node, "varlog")] == [("/var/log", True)] and
-      volumes(lo_node, "varlog") == [{"hostPath": {"path": "/var/log"}, "name": "varlog"}])
-check("/var/log is not mounted on any other agent",
-      not any(mounts(cr, "varlog") for name, cr in lo_crs.items() if name != AGENT))
+var_log_paths = sorted(set(re.findall(r"/var/log[^\s'\"]*", json.dumps(lo))))
+check("every path under /var/log in the otelConfig is under /var/log/pods",
+      bool(var_log_paths) and all(p == "/var/log/pods" or p.startswith("/var/log/pods/") for p in var_log_paths))
+check("/var/log/pods is mounted read-only on the node agent",
+      [(m.get("mountPath"), m.get("readOnly")) for m in mounts(lo_node, "criologs")] == [("/var/log/pods", True)] and
+      volumes(lo_node, "criologs") == [{"hostPath": {"path": "/var/log/pods"}, "name": "criologs"}])
+check("/var/log is not mounted on any agent (only /var/log/pods is read)",
+      not any(mounts(cr, "varlog") or volumes(cr, "varlog") for cr in lo_crs.values()))
 check("the state volume is mounted on the node agent", len(mounts(lo_node, "otelstate")) == 1)
+
+
+def without_state(spec):
+    """The CR spec without the otelConfig and the otelstate volume and mount."""
+    out = {k: v for k, v in spec.items() if k != "otelConfig"}
+    for k in ("volumes", "volumeMounts"):
+        out[k] = [x for x in spec.get(k) or [] if x.get("name") != "otelstate"]
+    return out
+
+
+lo_base_node = agent_crs("logs_off").get(AGENT) or {"spec": {}}
+check("the node agent CR differs from the logs-off render with both flags off (byte-identical to "
+      "origin/main) only by the otelConfig and the otelstate volume and mount",
+      without_state(lo_node["spec"]) == without_state(lo_base_node["spec"]) and
+      lo_node["spec"].get("otelConfig") != lo_base_node["spec"].get("otelConfig") and
+      len(volumes(lo_node, "otelstate")) == 1 and not volumes(lo_base_node, "otelstate"))
+check("the other agent CRs are as in the logs-off render with both flags off",
+      {n: cr for n, cr in lo_crs.items() if n != AGENT} ==
+      {n: cr for n, cr in agent_crs("logs_off").items() if n != AGENT})
 check(f"{STORAGE} is in service.extensions", STORAGE in ((lo.get("service") or {}).get("extensions") or []))
 as_exporter, as_receiver = connector_users(lo)
 check("the connector links the two pipelines", as_exporter == [APP_PIPELINE] and as_receiver == [VLLM_PIPELINE])
@@ -679,6 +827,21 @@ def emit(name):
 check("emitInterval empty follows metricResolution (20s)", emit("emit_metric_resolution") == "20s")
 check('emitInterval "15s" is used as is', emit("emit_15s") == "15s")
 check('emitInterval "1h" is used as is', emit("emit_1h") == "1h")
+
+
+def poll(name):
+    return (section(otel_config(name), "receivers").get(APP_RECEIVER) or {}).get("poll_interval")
+
+
+# The logs-off poll interval is 10s, or the effective emit interval when that is shorter.
+for name, want, desc in (("poll_emit_5s", "5s", "emitInterval 5s"),
+                         ("info_logs_off", "10s", "emitInterval 30s (the default, from metricResolution)"),
+                         ("poll_emit_2m", "10s", "emitInterval 2m"),
+                         ("poll_resolution_8s", "8s", "emitInterval empty, metricResolution 8s")):
+    check(f"logs off, {desc}: {APP_RECEIVER} poll_interval {want}", poll(name) == want)
+check(f"logs on, emitInterval 5s: {APP_RECEIVER} keeps the receiver default (no poll_interval)",
+      rc("poll_emit_5s_logs_on") == 0 and poll("poll_emit_5s_logs_on") is None and
+      APP_RECEIVER in section(otel_config("poll_emit_5s_logs_on"), "receivers"))
 for bad in ("15", "0s", "25h", "1m30s", "abc"):
     check(f'emitInterval "{bad}" fails the render with a message naming the setting',
           rc(f"emit_bad_{bad}") != 0 and "configInfo.emitInterval" in err(f"emit_bad_{bad}"))
