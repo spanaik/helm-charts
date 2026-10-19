@@ -123,8 +123,8 @@ end of each file, and the lines written while it was down are not shipped. To ke
 checkpoints in the storage, set `otelContainerInsights.stateStorage.enabled=true`. A restarted
 agent then continues each file where it stopped.
 
-With logs on, the agent reads only the log lines written after it starts. A vLLM pod can
-already run when the agent first starts. Its series then starts after the pod's next restart.
+With logs on, the agent reads only the log lines written after it starts. If a vLLM pod
+already runs at the first agent start, its series starts after the pod's next restart.
 Without checkpoints, the same applies to a vLLM pod that starts while the agent is down. The
 settings that the agent already has survive the restart.
 
