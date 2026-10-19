@@ -1190,9 +1190,10 @@ connectors:
         # creates and filelog/cw_k8s_ci_v0_app parses, so it is there in every mode
         # and does not wait for the k8sattributes pod cache. One series per container.
         # A pod replaced under the same name (a StatefulSet pod) keeps the previous
-        # facts until its own startup line arrives. A deleted pod's series is dropped
-        # by filter/cw_k8s_ci_v0_vllm_info_live. With no identity_output_prefix, every
-        # identity key must also be in include_resource_attributes.
+        # facts until its own startup line arrives, or until it is deleted if that line
+        # never comes. A deleted pod's series is dropped by
+        # filter/cw_k8s_ci_v0_vllm_info_live. The connector requires every identity key
+        # in include_resource_attributes.
         identity: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
         include_resource_attributes: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
         max_entities: {{ include "otel-container-insights.vllmInfoInt" (dict "name" "maxEntities" "value" .Values.otelContainerInsights.solutions.vllm.configInfo.maxEntities "min" 1 "max" 100000) }}
