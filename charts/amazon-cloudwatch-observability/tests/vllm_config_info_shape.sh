@@ -17,11 +17,16 @@
 #   2. No new pipeline: the connector is a second exporter of logs/cw_k8s_ci_v0_app
 #      and a second receiver of metrics/cw_k8s_ci_v0_vllm.
 #   3. Logs-off mode (configInfo on, logs.enabled off): the app-log pipeline runs only
-#      to feed the connector, ships nothing, and runs only the processors the
-#      connector needs. No mode defines a component that no pipeline uses.
-#   4. Stale facts are dropped right after k8sattributes adds the live pod UID.
+#      to feed the connector, ships nothing, and has no processors. In every mode,
+#      every defined component is used and every used component is defined.
+#   4. Identity: the connector keys on the namespace, pod and container that the
+#      app-log receiver parses from the log file name. Right after k8sattributes,
+#      the Info metric of a pod that k8sattributes cannot find (no k8s.pod.uid) is
+#      dropped. No scraped vllm:* or http_* series is ever dropped.
 #   5. Storage: one file_storage extension, a writable hostPath on the node agent
-#      DaemonSet only, and maxSurge 0.
+#      DaemonSet only, and maxSurge 0. configInfo does not change log shipping: with
+#      logs on, the app-log receiver checkpoints only with stateStorage.enabled. In
+#      logs-off mode it always checkpoints.
 #   6. The connector's OTTL survives the three escaping layers (Helm text, YAML,
 #      OTTL strings): each pattern is unescaped as OTTL would and run against sample
 #      vLLM startup lines.
@@ -45,6 +50,7 @@ COMMON=(--set region=us-west-2 --set clusterName=test-cluster)
 OTEL=(--set otelContainerInsights.enabled=true)
 INFO=(--set otelContainerInsights.solutions.vllm.configInfo.enabled=true)
 LOGS_OFF=(--set otelContainerInsights.logs.enabled=false)
+STORAGE_ON=(--set otelContainerInsights.stateStorage.enabled=true)
 # Every new setting changed while both new flags stay off: must change nothing.
 OFF_TUNED=(--set otelContainerInsights.stateStorage.hostPath=/var/lib/elsewhere
            --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=15s
@@ -71,11 +77,13 @@ render "$CHART_DIR" logs_on_tuned "${OTEL[@]}" "${OFF_TUNED[@]}"
 render "$CHART_DIR" logs_on_surge "${OTEL[@]}" "${MAX_SURGE_1[@]}"
 render "$CHART_DIR" info_logs_on "${OTEL[@]}" "${INFO[@]}"
 render "$CHART_DIR" info_logs_off "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}"
+render "$CHART_DIR" info_storage_logs_on "${OTEL[@]}" "${INFO[@]}" "${STORAGE_ON[@]}"
+render "$CHART_DIR" info_storage_logs_off "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" "${STORAGE_ON[@]}"
 render "$CHART_DIR" vllm_off "${OTEL[@]}" --set otelContainerInsights.solutions.vllm.enabled=false
 render "$CHART_DIR" info_vllm_off "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.enabled=false
 render "$CHART_DIR" info_otel_off "${INFO[@]}"
-render "$CHART_DIR" storage_only "${OTEL[@]}" --set otelContainerInsights.stateStorage.enabled=true
-render "$CHART_DIR" storage_only_logs_off "${OTEL[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.stateStorage.enabled=true
+render "$CHART_DIR" storage_only "${OTEL[@]}" "${STORAGE_ON[@]}"
+render "$CHART_DIR" storage_only_logs_off "${OTEL[@]}" "${LOGS_OFF[@]}" "${STORAGE_ON[@]}"
 render "$CHART_DIR" emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.metricResolution=20s
 render "$CHART_DIR" emit_15s "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=15s
 render "$CHART_DIR" emit_1h "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=1h
@@ -85,9 +93,10 @@ done
 render "$CHART_DIR" bad_max_state_bytes "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxStateBytes=1000
 render "$CHART_DIR" bad_max_value_length "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxValueLength=2000
 render "$CHART_DIR" bad_max_entities "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxEntities=0
-render "$CHART_DIR" bad_host_path "${OTEL[@]}" --set otelContainerInsights.stateStorage.enabled=true --set otelContainerInsights.stateStorage.hostPath=relative/dir
+render "$CHART_DIR" bad_host_path "${OTEL[@]}" "${STORAGE_ON[@]}" --set otelContainerInsights.stateStorage.hostPath=relative/dir
 render "$CHART_DIR" surge_info "${OTEL[@]}" "${INFO[@]}" "${MAX_SURGE_1[@]}"
-render "$CHART_DIR" surge_storage "${OTEL[@]}" --set otelContainerInsights.stateStorage.enabled=true "${MAX_SURGE_1[@]}"
+render "$CHART_DIR" surge_info_logs_off "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" "${MAX_SURGE_1[@]}"
+render "$CHART_DIR" surge_storage "${OTEL[@]}" "${STORAGE_ON[@]}" "${MAX_SURGE_1[@]}"
 render "$CHART_DIR" surge_agents_entry "${OTEL[@]}" "${INFO[@]}" \
     --set 'agents[0].name=cloudwatch-agent' \
     --set 'agents[0].updateStrategy.type=RollingUpdate' \
@@ -141,12 +150,16 @@ LIVE = "filter/cw_k8s_ci_v0_vllm_info_live"
 CLEANUP = "transform/cw_k8s_ci_v0_vllm_info_cleanup"
 PREFILTER = "filter/cw_k8s_ci_v0_vllm_info_prefilter"
 INFO_METRIC = "vllm_engine_config_info"
-# The connector matches the startup line by plain substrings, no regex; the logs-off
-# prefilter keeps every record containing PREFILTER_SUBSTRING, so it must be a
-# substring of each of them.
+# The connector matches the startup line by plain substrings, no regex.
 BODY_CONTAINS = ["Initializing an LLM engine (v", "Initializing a V0 LLM engine (v",
                  "Initializing a V1 LLM engine (v"]
-PREFILTER_SUBSTRING = "LLM engine (v"
+# The connector's identity: what the app-log receiver parses from the log file name.
+IDENTITY = ["k8s.namespace.name", "k8s.pod.name", "k8s.container.name"]
+# Every mode the checks below look at, for the component cross-checks.
+MODES = ("default", "logs_on", "logs_off", "logs_on_tuned", "info_logs_on", "info_logs_off",
+         "info_storage_logs_on", "info_storage_logs_off", "storage_only", "storage_only_logs_off",
+         "vllm_off", "info_vllm_off", "info_otel_off", "emit_metric_resolution", "emit_15s",
+         "emit_1h", "surge_on_delete")
 
 GREEN, RED, YELLOW, RESET = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
 passed = failed = 0
@@ -238,15 +251,40 @@ def undefined_components(cfg):
 
 
 def unused_components(cfg):
-    """Components defined but used by no pipeline (extensions: not in service.extensions)."""
-    used = set()
+    """Components defined but used by no pipeline (extensions: not in service.extensions;
+    connectors: not used both as an exporter and as a receiver)."""
+    used = {k: set() for k in ("receivers", "processors", "exporters")}
     for p in pipelines(cfg).values():
-        for k in ("receivers", "processors", "exporters"):
-            used |= set(p.get(k) or [])
-    unused = [c for k in ("receivers", "processors", "exporters", "connectors")
-              for c in section(cfg, k) if c not in used]
+        for k in used:
+            used[k] |= set(p.get(k) or [])
+    unused = [c for k in used for c in section(cfg, k) if c not in used[k]]
+    unused += [c for c in section(cfg, "connectors")
+               if c not in used["exporters"] or c not in used["receivers"]]
     started = set((cfg.get("service") or {}).get("extensions") or [])
     return unused + [e for e in section(cfg, "extensions") if e not in started]
+
+
+def file_name_attributes(cfg, file_path):
+    """The resource attributes APP_RECEIVER sets from file_path: its regex_parser on
+    log.file.path into the resource, then a move of each capture group to a resource key."""
+    rec = section(cfg, "receivers").get(APP_RECEIVER) or {}
+    ops = rec.get("operators") or []
+    parsers = [o for o in ops if o.get("type") == "regex_parser" and
+               o.get("parse_from") == 'attributes["log.file.path"]' and o.get("parse_to") == "resource"]
+    if rec.get("include_file_path") is not True or len(parsers) != 1:
+        return {}
+    m = re.match(parsers[0].get("regex") or "", file_path)
+    if not m:
+        return {}
+    out = {}
+    for o in ops:
+        if o.get("type") != "move":
+            continue
+        src = re.fullmatch(r"resource\.(\w+)", o.get("from") or "")
+        dst = re.fullmatch(r'resource\["([^"]+)"\]', o.get("to") or "")
+        if src and dst and src.group(1) in m.groupdict():
+            out[dst.group(1)] = m.group(src.group(1))
+    return out
 
 
 def mentions(cfg, component):
@@ -360,9 +398,7 @@ OPTIONAL = ["served_model_name", "dtype", "max_seq_len", "tensor_parallel_size",
 
 # Guards: without these, the assertions below could pass on empty input.
 print(f"\n{YELLOW}[renders]{RESET}")
-for name in ("default", "logs_on", "logs_off", "logs_on_tuned", "logs_on_surge", "info_logs_on",
-             "info_logs_off", "info_vllm_off", "info_otel_off", "storage_only", "storage_only_logs_off",
-             "emit_metric_resolution", "emit_15s", "emit_1h", "surge_on_delete"):
+for name in MODES + ("logs_on_surge", "vllm_off"):
     if not check(f"{name} renders", rc(name) == 0):
         print("    " + err(name).strip().replace("\n", "\n    "))
 check("the node agent CR renders an otelConfig with configInfo on", bool(otel_config("info_logs_on")))
@@ -399,7 +435,6 @@ on = otel_config("info_logs_on")
 off = otel_config("logs_on")
 check("no new pipeline: same service.pipelines keys as the logs-on render",
       set(pipelines(on)) == set(pipelines(off)))
-check("every component named in service is defined", not undefined_components(on))
 as_exporter, as_receiver = connector_users(on)
 check(f"the connector is an exporter of {APP_PIPELINE} only", as_exporter == [APP_PIPELINE])
 check(f"the connector is a receiver of {VLLM_PIPELINE} only", as_receiver == [VLLM_PIPELINE])
@@ -407,8 +442,9 @@ check(f"{APP_PIPELINE} still ships logs, then feeds the connector",
       pipeline(on, APP_PIPELINE).get("exporters") == [APP_EXPORTER, CONNECTOR])
 check(f"{VLLM_PIPELINE} keeps its scrape receiver first",
       pipeline(on, VLLM_PIPELINE).get("receivers") == [VLLM_RECEIVER, CONNECTOR])
-check(f"{APP_PIPELINE} processors are unchanged (no prefilter while logs are shipped)",
+check(f"{APP_PIPELINE} processors are unchanged",
       pipeline(on, APP_PIPELINE).get("processors") == pipeline(off, APP_PIPELINE).get("processors"))
+check(f"no {PREFILTER} and no {CLEANUP}", not mentions(on, PREFILTER) and not mentions(on, CLEANUP))
 
 connector = section(on, "connectors").get(CONNECTOR) or {}
 rules = connector.get("rules") or [{}]
@@ -419,13 +455,12 @@ check("max_state_bytes and max_value_length come from values",
       connector.get("max_state_bytes") == 1048576 and connector.get("max_value_length") == 256)
 check(f"one rule, {INFO_METRIC}, with max_entities 500",
       len(rules) == 1 and rule.get("name") == INFO_METRIC and rule.get("max_entities") == 500)
-check("the rule is keyed on the pod UID and copies pod name, namespace and container",
-      rule.get("identity") == ["k8s.pod.uid"] and
-      rule.get("include_resource_attributes") == ["k8s.pod.name", "k8s.namespace.name", "k8s.container.name"])
+check(f"the rule is keyed on {IDENTITY} and copies the same three to the resource",
+      rule.get("identity") == IDENTITY and rule.get("include_resource_attributes") == IDENTITY)
+check("no identity_output_prefix (the identity keys are plain resource attributes)",
+      "identity_output_prefix" not in connector)
 check("the startup line is matched by the three body_contains substrings, with no OTTL condition",
       rule.get("body_contains") == BODY_CONTAINS and "conditions" not in rule)
-check(f"each body_contains substring contains the prefilter's {PREFILTER_SUBSTRING!r}",
-      all(PREFILTER_SUBSTRING in b for b in BODY_CONTAINS))
 attrs = rule.get("attributes") or []
 by_key = {a.get("key"): a for a in attrs}
 check("the 14 facts, required first", [a.get("key") for a in attrs] == REQUIRED + list(DEFAULTED) + OPTIONAL)
@@ -476,30 +511,44 @@ check(f"{STORAGE} compacts on start and on rebound, in the same directory",
       compaction.get("on_start") is True and compaction.get("on_rebound") is True and
       compaction.get("directory") == HOST_PATH)
 check(f"{STORAGE} recreates a file it cannot open", storage.get("recreate") is True)
-app_receiver = section(on, "receivers").get(APP_RECEIVER) or {}
-check(f"{APP_RECEIVER} checkpoints in {STORAGE}", app_receiver.get("storage") == STORAGE)
-check(f"{APP_RECEIVER} still starts at the end while logs are shipped", app_receiver.get("start_at") == "end")
+check(f"configInfo does not change log shipping: {APP_RECEIVER} (no checkpoints, start_at end) "
+      f"and {APP_EXPORTER} are as in the logs-on render",
+      section(on, "receivers").get(APP_RECEIVER) == section(off, "receivers").get(APP_RECEIVER) and
+      "storage" not in (section(on, "receivers").get(APP_RECEIVER) or {"storage": 1}) and
+      section(on, "exporters").get(APP_EXPORTER) == section(off, "exporters").get(APP_EXPORTER))
 
-# 4. Stale facts.
+# 4. Identity and liveness.
+SAMPLE_PATH = "/var/log/containers/vllm-0_ml-serving_vllm-server-" + "0123456789abcdef" * 4 + ".log"
+SAMPLE_IDENTITY = {"k8s.pod.name": "vllm-0", "k8s.namespace.name": "ml-serving",
+                   "k8s.container.name": "vllm-server"}
+for name in ("info_logs_on", "info_logs_off"):
+    got = file_name_attributes(otel_config(name), SAMPLE_PATH)
+    if not check(f"{name}: {APP_RECEIVER} sets every identity key from the log file name",
+                 {k: got.get(k) for k in IDENTITY} == SAMPLE_IDENTITY):
+        print(f"    got {got}")
 chain = pipeline(on, VLLM_PIPELINE).get("processors") or []
 pod_at = chain.index(POD) if POD in chain else -1
-check(f"{LIVE} and {CLEANUP} follow {POD} directly",
-      pod_at >= 0 and chain[pod_at + 1:pod_at + 3] == [LIVE, CLEANUP])
-check(f"apart from those two, {VLLM_PIPELINE} processors are unchanged",
-      [p for p in chain if p not in (LIVE, CLEANUP)] == pipeline(off, VLLM_PIPELINE).get("processors"))
-identity_key = (connector.get("identity_output_prefix") or "") + "k8s.pod.uid"
-live = (section(on, "processors").get(LIVE) or {})
+check(f"{LIVE} follows {POD} directly", pod_at >= 0 and chain[pod_at + 1:pod_at + 2] == [LIVE])
+check(f"apart from {LIVE}, {VLLM_PIPELINE} processors are unchanged",
+      [p for p in chain if p != LIVE] == pipeline(off, VLLM_PIPELINE).get("processors"))
+pod_proc = section(on, "processors").get(POD) or {}
+associations = [[(s.get("from"), s.get("name")) for s in a.get("sources") or []]
+                for a in pod_proc.get("pod_association") or []]
+check(f"{POD} adds k8s.pod.uid, looked up by the k8s.pod.name and k8s.namespace.name that the "
+      "Info metric carries (so the PromQL join on @resource.k8s.pod.uid holds)",
+      "k8s.pod.uid" in ((pod_proc.get("extract") or {}).get("metadata") or []) and
+      [("resource_attribute", "k8s.pod.name"), ("resource_attribute", "k8s.namespace.name")] in associations and
+      {"k8s.pod.name", "k8s.namespace.name"} <= set(rule.get("include_resource_attributes") or []))
+live = section(on, "processors").get(LIVE) or {}
 live_conditions = ((live.get("metrics") or {}).get("datapoint")) or []
-check(f"{LIVE} drops a data point whose {identity_key} is not the live k8s.pod.uid",
-      live.get("error_mode") == "ignore" and live_conditions == [
-          f'resource.attributes["{identity_key}"] != nil and '
-          f'resource.attributes["{identity_key}"] != resource.attributes["k8s.pod.uid"]'])
-cleanup = section(on, "processors").get(CLEANUP) or {}
-cleanup_statements = [(g.get("context"), st) for g in cleanup.get("metric_statements") or []
-                      for st in g.get("statements") or []]
-check(f"{CLEANUP} deletes {identity_key} from the resource",
-      len(cleanup_statements) == 1 and cleanup_statements[0][0] == "resource" and
-      cleanup_statements[0][1].startswith(f'delete_key(attributes, "{identity_key}")'))
+check(f"{LIVE} drops a {INFO_METRIC} data point that has no k8s.pod.uid",
+      live.get("error_mode") == "ignore" and set(live) == {"error_mode", "metrics"} and
+      set(live.get("metrics") or {}) == {"datapoint"} and live_conditions == [
+          f'metric.name == "{INFO_METRIC}" and resource.attributes["k8s.pod.uid"] == nil'])
+check(f"{LIVE} never drops a scraped series: each condition is an 'and' that names {INFO_METRIC}, "
+      "which is not a vllm:* or http_* name",
+      bool(live_conditions) and not re.match(r"^(vllm:|http_)", INFO_METRIC) and
+      all(" or " not in c and f'metric.name == "{INFO_METRIC}"' in c.split(" and ") for c in live_conditions))
 
 keep_on = ((section(on, "processors").get(KEEP) or {}).get("metrics") or {}).get("metric") or []
 keep_off = ((section(off, "processors").get(KEEP) or {}).get("metrics") or {}).get("metric") or []
@@ -528,28 +577,20 @@ check("the cluster-scraper has no connector or storage",
 print(f"\n{YELLOW}[configInfo on, logs off]{RESET}")
 lo = otel_config("info_logs_off")
 lo_base = otel_config("logs_off")
-check("every component named in service is defined", not undefined_components(lo))
 check(f"the only pipeline added to the logs-off render is {APP_PIPELINE}",
       set(pipelines(lo)) == set(pipelines(lo_base)) | {APP_PIPELINE} and APP_PIPELINE not in pipelines(lo_base))
-check(f"{APP_PIPELINE} exports only to the connector",
-      pipeline(lo, APP_PIPELINE).get("exporters") == [CONNECTOR])
-lo_chain = pipeline(lo, APP_PIPELINE).get("processors") or []
-check(f"{APP_PIPELINE} runs only {PREFILTER}, then {POD} (which adds k8s.pod.uid)",
-      lo_chain == [PREFILTER, POD])
+check(f"{APP_PIPELINE} is {APP_RECEIVER} straight to the connector, with no processors",
+      pipeline(lo, APP_PIPELINE) == {"receivers": [APP_RECEIVER], "exporters": [CONNECTOR]})
+check(f"no {PREFILTER} and no {CLEANUP} defined", not mentions(lo, PREFILTER) and not mentions(lo, CLEANUP))
 check("the log-shipping processors are not defined",
       not any(x.startswith(("transform/cw_k8s_ci_v0_logs_", "batch/cw_k8s_ci_v0_logs_"))
               for x in section(lo, "processors")))
-prefilter = section(lo, "processors").get(PREFILTER) or {}
-pre_conditions = ((prefilter.get("logs") or {}).get("log_record")) or []
-check(f"{PREFILTER} drops records whose body lacks {PREFILTER_SUBSTRING!r}, by substring (Index), no regex",
-      prefilter.get("error_mode") == "ignore" and pre_conditions == [f'Index(body, "{PREFILTER_SUBSTRING}") == -1'])
-pre_re = re.fullmatch(r'Index\(body, ' + OTTL_STRING + r'\) == -1', pre_conditions[0] if pre_conditions else "")
-check(f"{PREFILTER} keeps every sample startup line and drops an unrelated line",
-      bool(pre_re) and all(ottl_unescape(pre_re.group(1)) in line for line, _ in EXPECTED.values()) and
-      ottl_unescape(pre_re.group(1)) not in UNRELATED_LINE)
+check(f"{VLLM_PIPELINE} and {LIVE} are as with logs on",
+      pipeline(lo, VLLM_PIPELINE) == pipeline(on, VLLM_PIPELINE) and
+      section(lo, "processors").get(LIVE) == section(on, "processors").get(LIVE))
+check("the connector is the same as with logs on", section(lo, "connectors") == section(on, "connectors"))
 lo_receiver = section(lo, "receivers").get(APP_RECEIVER) or {}
 check(f"{APP_RECEIVER} starts at the beginning (nothing is shipped)", lo_receiver.get("start_at") == "beginning")
-check(f"{APP_RECEIVER} checkpoints in {STORAGE}", lo_receiver.get("storage") == STORAGE)
 check(f"no {APP_EXPORTER}, host-log pipeline, or logs auth extensions",
       APP_EXPORTER not in section(lo, "exporters") and "logs/cw_k8s_ci_v0_node" not in pipelines(lo) and
       "filelog/cw_k8s_ci_v0_node" not in section(lo, "receivers") and
@@ -571,12 +612,8 @@ check("the connector links the two pipelines", as_exporter == [APP_PIPELINE] and
 # --- stateStorage on, configInfo off -----------------------------------------------
 print(f"\n{YELLOW}[stateStorage on, configInfo off]{RESET}")
 so = otel_config("storage_only")
-check("every component named in service is defined", not undefined_components(so))
 check(f"{STORAGE} is defined and in service.extensions",
       STORAGE in section(so, "extensions") and STORAGE in ((so.get("service") or {}).get("extensions") or []))
-check(f"{APP_RECEIVER} checkpoints in {STORAGE} and starts at the end",
-      (section(so, "receivers").get(APP_RECEIVER) or {}).get("storage") == STORAGE and
-      (section(so, "receivers").get(APP_RECEIVER) or {}).get("start_at") == "end")
 check("no connector anywhere", not any(mentions(otel_config("storage_only", a), CONNECTOR) for a in agent_crs("storage_only")))
 check("no Info metric processors, and the vLLM pipeline and keep filter are unchanged",
       not any(mentions(so, x) for x in (LIVE, CLEANUP, PREFILTER)) and
@@ -592,13 +629,41 @@ check("with logs off, the storage alone does not turn on the app-log pipeline",
       APP_PIPELINE not in pipelines(sol) and APP_RECEIVER not in section(sol, "receivers") and
       set(pipelines(sol)) == set(pipelines(lo_base)))
 
-# --- every mode: nothing defined that no pipeline uses ------------------------------
-print(f"\n{YELLOW}[no unused components]{RESET}")
-for name in ("default", "logs_on", "logs_off", "info_logs_on", "info_logs_off", "storage_only",
-             "storage_only_logs_off", "info_vllm_off"):
+# --- app-log checkpoints --------------------------------------------------------------
+print(f"\n{YELLOW}[app-log checkpoints]{RESET}")
+for name, want_storage, want_start, desc in (
+        ("logs_on", None, "end", "logs on, both flags off"),
+        ("info_logs_on", None, "end", "configInfo on, logs on, stateStorage off"),
+        ("info_storage_logs_on", STORAGE, "end", "configInfo on, logs on, stateStorage on"),
+        ("info_logs_off", STORAGE, "beginning", "configInfo on, logs off, stateStorage off"),
+        ("info_storage_logs_off", STORAGE, "beginning", "configInfo on, logs off, stateStorage on"),
+        ("storage_only", STORAGE, "end", "stateStorage only, logs on")):
+    cfg = otel_config(name)
+    rec = section(cfg, "receivers").get(APP_RECEIVER)
+    got_storage = (rec or {}).get("storage")
+    check(f"{desc}: {APP_RECEIVER} storage {want_storage or 'absent'}, start_at {want_start}",
+          rec is not None and got_storage == want_storage and rec.get("start_at") == want_start and
+          (want_storage is None or STORAGE in section(cfg, "extensions")))
+check("stateStorage only, logs off: no app-log receiver to checkpoint",
+      APP_RECEIVER not in section(otel_config("storage_only_logs_off"), "receivers"))
+check("configInfo on, stateStorage on, logs on: the receiver is the one of stateStorage only",
+      section(otel_config("info_storage_logs_on"), "receivers").get(APP_RECEIVER) ==
+      section(so, "receivers").get(APP_RECEIVER))
+check("configInfo on, logs off: stateStorage changes nothing in the otelConfig",
+      otel_config("info_storage_logs_off") == lo)
+for name in ("info_logs_on", "info_storage_logs_on", "info_logs_off", "info_storage_logs_off"):
+    check(f"{name}: the connector keeps its state in {STORAGE}",
+          (section(otel_config(name), "connectors").get(CONNECTOR) or {}).get("storage") == STORAGE)
+
+# --- every mode: every defined component is used, every used one is defined ---------
+print(f"\n{YELLOW}[components defined and used]{RESET}")
+for name in MODES:
     for agent in agent_crs(name):
         cfg = otel_config(name, agent)
         if cfg:
+            missing = undefined_components(cfg)
+            if not check(f"{name} / {agent}: every used component is defined", not missing):
+                print(f"    undefined: {missing}")
             leftover = unused_components(cfg)
             if not check(f"{name} / {agent}: every defined component is used", not leftover):
                 print(f"    unused: {leftover}")
@@ -627,6 +692,7 @@ check("a relative stateStorage.hostPath fails the render",
 # --- maxSurge guard ------------------------------------------------------------------
 print(f"\n{YELLOW}[maxSurge guard]{RESET}")
 for name, desc in (("surge_info", "configInfo on, agent maxSurge 1"),
+                   ("surge_info_logs_off", "configInfo on, logs off, agent maxSurge 1"),
                    ("surge_storage", "stateStorage on, agent maxSurge 1"),
                    ("surge_agents_entry", "configInfo on, agents[] entry maxSurge 10%")):
     check(f"{desc}: fails the render with a maxSurge message",

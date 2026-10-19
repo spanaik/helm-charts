@@ -459,7 +459,9 @@ true
 {{/*
 "true" when the node agent gets the shared state storage (file_storage/cw_k8s_ci_v0_state and
 its hostPath mount), empty otherwise. The vLLM config Info metric keeps its facts there, so it
-turns the storage on by itself.
+turns the storage on by itself. While logs are shipped, it does not turn on the app-log
+receiver's checkpoints: those need stateStorage.enabled ($appLogCheckpoints in
+otel-container-insights.config).
 */}}
 {{- define "otel-container-insights.stateStorageEnabled" -}}
 {{- if and .Values.otelContainerInsights.enabled (or .Values.otelContainerInsights.stateStorage.enabled (include "otel-container-insights.configInfoEnabled" .)) -}}
