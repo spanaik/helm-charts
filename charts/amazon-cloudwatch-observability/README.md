@@ -168,6 +168,11 @@ Info series with the settings of a previous pod with the same name. The pod UID 
 clusters, and a replacement pod with the same name gets a new one. The `max by` keeps one series
 for each pod and set of settings. Use a `last_over_time` window longer than `emitInterval`.
 
+A pod with two vLLM containers whose version or model differ has two Info series with one pod
+UID. The join then fails, because PromQL finds two series on the Info side for one pod. For
+such a pod, select one container on the Info side, for example
+`{"vllm_engine_config_info", "@resource.k8s.container.name"="vllm"}`.
+
 ## KServe control-plane metrics
 
 Set under `otelContainerInsights.solutions.kserve.controlPlane`, on by default. The

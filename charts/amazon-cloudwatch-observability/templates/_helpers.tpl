@@ -529,12 +529,13 @@ A non-numeric value converts to 0, which is below every minimum.
 
 {{/*
 hostPath of the shared state storage. Must be an absolute path: it is both the node directory
-and the mount path inside the agent container.
+and the mount path inside the agent container. A "." or ".." segment is rejected, so the path
+cannot resolve to / or leave the given directory.
 */}}
 {{- define "otel-container-insights.stateStorageHostPath" -}}
 {{- $path := .Values.otelContainerInsights.stateStorage.hostPath | toString -}}
-{{- if not (regexMatch "^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$" $path) -}}
-  {{- fail (printf "otelContainerInsights.stateStorage.hostPath must be an absolute directory path other than / (letters, digits, '.', '_', '-', '/'), got: %s" $path) -}}
+{{- if or (not (regexMatch "^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$" $path)) (regexMatch "(^|/)[.][.]?(/|$)" $path) -}}
+  {{- fail (printf "otelContainerInsights.stateStorage.hostPath must be an absolute directory path other than / (letters, digits, '.', '_', '-', '/', no '.' or '..' segment), got: %s" $path) -}}
 {{- end -}}
 {{- $path -}}
 {{- end -}}

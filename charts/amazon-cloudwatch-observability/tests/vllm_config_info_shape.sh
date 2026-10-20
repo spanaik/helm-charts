@@ -140,6 +140,10 @@ render "$CHART_DIR" bad_max_state_bytes "${OTEL[@]}" "${INFO[@]}" --set "${CONFI
 render "$CHART_DIR" bad_max_value_length "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxValueLength=2000"
 render "$CHART_DIR" bad_max_entities "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxEntities=0"
 render "$CHART_DIR" bad_host_path "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=relative/dir"
+render "$CHART_DIR" bad_host_path_dot "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/."
+render "$CHART_DIR" bad_host_path_dotdot "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/.."
+render "$CHART_DIR" bad_host_path_inner "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/./lib/x"
+render "$CHART_DIR" good_host_path_dots "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/lib/.state..d"
 render "$CHART_DIR" surge_info "${OTEL[@]}" "${INFO[@]}" "${MAX_SURGE_1[@]}"
 render "$CHART_DIR" surge_storage "${OTEL[@]}" "${STORAGE_ON[@]}" "${MAX_SURGE_1[@]}"
 render "$CHART_DIR" surge_agents_entry "${OTEL[@]}" "${INFO[@]}" "${AGENTS_SURGE_10[@]}"
@@ -831,6 +835,12 @@ for name, setting in (("bad_max_state_bytes", "maxStateBytes"), ("bad_max_value_
           rc(name) != 0 and f"configInfo.{setting}" in err(name))
 check("a relative stateStorage.hostPath fails the render",
       rc("bad_host_path") != 0 and "stateStorage.hostPath" in err("bad_host_path"))
+for name, value in (("bad_host_path_dot", "/."), ("bad_host_path_dotdot", "/var/.."),
+                    ("bad_host_path_inner", "/var/./lib/x")):
+    check(f"a stateStorage.hostPath with a '.' or '..' segment ({value}) fails the render",
+          rc(name) != 0 and "stateStorage.hostPath" in err(name))
+check("a stateStorage.hostPath with dots inside a name (/var/lib/.state..d) renders",
+      rc("good_host_path_dots") == 0)
 check("logs off: no new setting is checked, as none takes effect (out-of-bounds values render)",
       rc("lo_out_of_bounds_info") == 0 and rc("lo_storage_out_of_bounds_info") == 0)
 
