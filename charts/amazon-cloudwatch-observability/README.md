@@ -83,8 +83,10 @@ Older vLLM versions log fewer settings. If the startup line does not log a setti
 is left out.
 
 It is off by default. Turn it on with `otelContainerInsights.solutions.vllm.configInfo.enabled=true`.
-It needs an agent image with the `signal_to_info_metric` connector. An older agent fails to
-start with it on.
+It needs `otelContainerInsights.logs.enabled=true`, because the agent reads the engine startup
+line in the application-log pipeline. With logs off, the chart renders nothing for this metric.
+It also needs an agent image with the `signal_to_info_metric` connector. An older agent fails
+to start with it on.
 
 The agent on each node reads the engine startup line from the container's log. The line
 contains `Initializing ... LLM engine (v...)`. The agent sends each series again every
@@ -92,11 +94,9 @@ contains `Initializing ... LLM engine (v...)`. The agent sends each series again
 Empty means `otelContainerInsights.metricResolution`. The value is `<N>s`, `<N>m` or `<N>h`,
 from 1s to 24h.
 
-The agent identifies each series by the namespace, pod and container in the log file path, so
-it does not wait for the Kubernetes API. With logs on, the agent reads the container logs in
-`/var/log/containers/<pod>_<namespace>_<container>-<id>.log`. With
-`otelContainerInsights.logs.enabled=false`, it reads the same logs in the files that kubelet
-writes, `/var/log/pods/<namespace>_<pod>_<uid>/<container>/<n>.log`.
+The agent identifies each series by the namespace, pod and container in the log file path,
+`/var/log/containers/<pod>_<namespace>_<container>-<id>.log`. So it does not wait for the
+Kubernetes API.
 
 The agent also keeps the UID of the pod that logged the startup line. Each time it sends a
 series, it finds the live pod with that name and compares the two UIDs:
@@ -111,12 +111,9 @@ series, it finds the live pod with that name and compares the two UIDs:
   keeps a deleted pod for a grace period of 120 seconds. After that, the agent finds no pod with
   that name and drops the series.
 
-With logs on, the `k8sattributes` processor of the log pipeline adds the UID to the startup
-line. When the agent starts, the processor loads its pod cache from the Kubernetes API. If the
-cache has no UID for a startup line, that series has no UID check until the next startup line of
-the container. With logs off, the agent reads the UID from the `/var/log/pods` path. A static
-pod then has no UID check. Kubelet starts a static pod from a file on the node, and its log
-directory does not have the pod UID from the Kubernetes API.
+The `k8sattributes` processor of the log pipeline adds the UID to the startup line. When the
+agent starts, the processor loads its pod cache from the Kubernetes API. If the cache has no UID
+for a startup line, that series has no UID check until the next startup line of the container.
 
 Caps, per agent:
 
@@ -132,38 +129,25 @@ uninstall the chart. One agent pod at a time locks the storage files. So the age
 `updateStrategy.rollingUpdate.maxSurge` must be 0, which is the DaemonSet default. The chart
 fails to render otherwise.
 
-The Info metric does not change log shipping. With logs on, the agent keeps no read positions
-(checkpoints) for the application log files by default. A restarted agent then starts at the
-end of each file, and the lines written while it was down are not shipped. To keep the
-checkpoints in the storage, set `otelContainerInsights.stateStorage.enabled=true`. A restarted
-agent then continues each file where it stopped.
+The Info metric does not change log shipping. The agent keeps no read positions (checkpoints)
+for the application log files by default. A restarted agent then starts at the end of each
+file, and the lines written while it was down are not shipped. To keep the checkpoints in the
+storage, set `otelContainerInsights.stateStorage.enabled=true`. A restarted agent then continues
+each file where it stopped. With logs off, the chart renders no storage, because no component
+uses it then.
 
-With logs on, the agent reads only the log lines written after it starts. If a vLLM pod
-already runs at the first agent start, its series starts after the pod's next restart.
+With logs on, the agent reads only the log lines written after it starts. So a vLLM pod that is
+already running when the feature is first turned on gets its series after its next restart.
 Without checkpoints, the same applies to a vLLM pod that starts while the agent is down. The
 settings that the agent already has survive the restart.
 
-With `otelContainerInsights.logs.enabled=false`, the agent still reads the pod logs on the
-node, but only for this metric. It uses only the engine startup line and ships no logs. In a
-test at 20,000 log lines per second, the agent used about 8 microseconds of CPU for each line.
-It also used about 94 microseconds for each log file at each check. A cache for the parse of
-each file path, and reading lines without a UTF-8 check, cut this cost by about a third. So a
-busy node with many log lines uses more agent CPU in this mode than with the metric off: 165
-millicores instead of 11 in that test. In this mode the agent always keeps checkpoints in the
-storage. On its first start it reads the current log file of each container from the
-beginning. If the startup line of a running engine is still in the current file, the agent
-finds it. Kubelet rotates a log file at 10 MiB by default, and the agent does not read rotated
-files. After a restart the agent continues from where it
-stopped. In this mode the agent checks the log files every 2 seconds. If `emitInterval` is
-shorter, the agent checks them every `emitInterval`. To use another interval, set
-`configInfo.pollInterval`, in the same format as `emitInterval`. A longer interval uses less
-CPU on a node with many quiet pods, because of the cost for each log file at each check. But
-above 2 seconds, the agent can miss the startup line of a pod whose log file rotates within
-seconds of its start. The agent sends a new series as soon as it reads the startup line. So the
-series starts within one check interval after the engine writes the line.
+The metric adds almost no cost to the agent. On an EKS test node at 2000 log lines per second,
+with application logs shipped, the node agent used 62.47 millicores of CPU with `configInfo` off
+and 62.40 millicores with it on. Its mean memory (RSS) was 138.7 MiB with `configInfo` off and
+140.3 MiB with it on.
 
-A new `emitInterval`, `pollInterval` or cap reaches the agent only after its pod restarts,
-because the operator updates the agent configuration, not the pod.
+A new `emitInterval` or cap reaches the agent only after its pod restarts, because the operator
+updates the agent configuration, not the pod.
 
 Fargate has no node agent DaemonSet. So a vLLM pod on Fargate gets no Info metric.
 

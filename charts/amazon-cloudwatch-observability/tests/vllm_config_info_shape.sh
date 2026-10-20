@@ -14,17 +14,13 @@
 #      Opt-in: with BASE_REF set (for example BASE_REF=origin/main), the renders are
 #      also compared byte for byte, generated certificates redacted, with the chart
 #      at that ref.
-#   2. No new pipeline: the connector is a second exporter of logs/cw_k8s_ci_v0_app
-#      and a second receiver of metrics/cw_k8s_ci_v0_vllm.
-#   3. Logs-off mode (configInfo on, logs.enabled off): the app-log pipeline runs only
-#      to feed the connector, ships nothing, and has no processors. Its receiver reads
-#      the kubelet's /var/log/pods files (the same containers as /var/log/containers
-#      with logs on), parses the names and the pod UID from that path in one regex with
-#      a cache of 1024 paths, reads with encoding utf8-raw, and polls every
-#      configInfo.pollInterval, or every 2s (or every emit interval, when that is
-#      shorter) when it is empty. The logs-on receiver has neither the cache nor the
-#      encoding. In every mode, every defined component is used and every used
-#      component is defined.
+#   2. One switch: the metric renders only with otelContainerInsights.enabled,
+#      logs.enabled, solutions.enabled, solutions.vllm.enabled and configInfo.enabled.
+#      With logs off, configInfo on renders byte for byte as configInfo off, for
+#      several value sets (with BASE_REF, also as the chart at that ref).
+#   3. No new pipeline: the connector is a second exporter of logs/cw_k8s_ci_v0_app
+#      and a second receiver of metrics/cw_k8s_ci_v0_vllm. In every render, every
+#      defined component is used and every used component is defined.
 #   4. Identity: the connector keys on the namespace, pod and container that the
 #      app-log receiver parses from the log file name, and also stores the k8s.pod.uid
 #      of the record. Before k8sattributes, that stored UID is set aside. Right after
@@ -32,12 +28,14 @@
 #      UID other than the stored one (a pod replaced under the same name), then the
 #      stored UID is removed. No scraped vllm:* or http_* series is ever dropped.
 #   5. Storage: one file_storage extension, a writable hostPath on the node agent
-#      DaemonSet only, and maxSurge 0. configInfo does not change log shipping: with
-#      logs on, the app-log receiver checkpoints only with stateStorage.enabled. In
-#      logs-off mode it always checkpoints.
+#      DaemonSet only, and maxSurge 0. configInfo does not change log shipping: the
+#      app-log receiver checkpoints only with stateStorage.enabled. With logs off, the
+#      storage does not render, even with stateStorage.enabled, as no component uses it.
 #   6. The connector's OTTL survives the three escaping layers (Helm text, YAML,
 #      OTTL strings): each pattern is unescaped as OTTL would and run against sample
-#      vLLM startup lines.
+#      vLLM startup lines. Opt-in: with VLLM_RULE_FILE set to the connector's
+#      testdata/vllm_rule.yaml in the amazon-cloudwatch-agent repository, the rendered
+#      rules are also compared with the rules in that file.
 #
 # Assertions run on the parsed otelConfig (PyYAML), not on rendered text.
 # This is a template-level test -- it renders locally and never touches a cluster.
@@ -51,91 +49,59 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HELM="${HELM:-helm}"
 BASE_REF="${BASE_REF:-}"
+VLLM_RULE_FILE="${VLLM_RULE_FILE:-}"
+JOBS="$(nproc 2>/dev/null || echo 4)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
+CI=otelContainerInsights
+CONFIG_INFO="${CI}.solutions.vllm.configInfo"
 COMMON=(--set region=us-west-2 --set clusterName=test-cluster)
-OTEL=(--set otelContainerInsights.enabled=true)
-INFO=(--set otelContainerInsights.solutions.vllm.configInfo.enabled=true)
-LOGS_OFF=(--set otelContainerInsights.logs.enabled=false)
-STORAGE_ON=(--set otelContainerInsights.stateStorage.enabled=true)
+OTEL=(--set "${CI}.enabled=true")
+INFO=(--set "${CONFIG_INFO}.enabled=true")
+LOGS_OFF=(--set "${CI}.logs.enabled=false")
+STORAGE_ON=(--set "${CI}.stateStorage.enabled=true")
 # Every new setting changed while both new flags stay off: must change nothing.
-OFF_TUNED=(--set otelContainerInsights.stateStorage.hostPath=/var/lib/elsewhere
-           --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=15s
-           --set otelContainerInsights.solutions.vllm.configInfo.pollInterval=10s
-           --set otelContainerInsights.solutions.vllm.configInfo.maxEntities=7
-           --set otelContainerInsights.solutions.vllm.configInfo.maxStateBytes=70000
-           --set otelContainerInsights.solutions.vllm.configInfo.maxValueLength=9)
+OFF_TUNED=(--set "${CI}.stateStorage.hostPath=/var/lib/elsewhere"
+           --set "${CONFIG_INFO}.emitInterval=15s"
+           --set "${CONFIG_INFO}.maxEntities=7"
+           --set "${CONFIG_INFO}.maxStateBytes=70000"
+           --set "${CONFIG_INFO}.maxValueLength=9")
+# Each value out of its bounds: fails the render while the setting takes effect.
+OUT_OF_BOUNDS=(--set "${CI}.stateStorage.hostPath=relative/dir"
+               --set "${CONFIG_INFO}.emitInterval=0s"
+               --set "${CONFIG_INFO}.maxEntities=0"
+               --set "${CONFIG_INFO}.maxStateBytes=1000"
+               --set "${CONFIG_INFO}.maxValueLength=2000")
 MAX_SURGE_1=(--set agent.updateStrategy.rollingUpdate.maxUnavailable=0
              --set agent.updateStrategy.rollingUpdate.maxSurge=1)
+AGENTS_SURGE_10=(--set 'agents[0].name=cloudwatch-agent'
+                 --set 'agents[0].updateStrategy.type=RollingUpdate'
+                 --set 'agents[0].updateStrategy.rollingUpdate.maxUnavailable=0'
+                 --set 'agents[0].updateStrategy.rollingUpdate.maxSurge=10%'
+                 --set 'agents[1].name=cloudwatch-agent-cluster-scraper'
+                 --set 'agents[1].mode=deployment'
+                 --set 'agents[1].config=default')
 
 # render <chart> <name> [helm args...]: writes <name>.yaml, <name>.err and <name>.rc.
+# Runs in the background, JOBS at a time. The renders are complete after wait.
+QUEUED=0
 render() {
     local chart="$1" name="$2"
     shift 2
-    local rc=0
-    "$HELM" template cw "$chart" --namespace amazon-cloudwatch "${COMMON[@]}" "$@" \
-        > "${TMP_DIR}/${name}.yaml" 2> "${TMP_DIR}/${name}.err" || rc=$?
-    echo "$rc" > "${TMP_DIR}/${name}.rc"
+    (
+        rc=0
+        "$HELM" template cw "$chart" --namespace amazon-cloudwatch "${COMMON[@]}" "$@" \
+            > "${TMP_DIR}/${name}.yaml" 2> "${TMP_DIR}/${name}.err" || rc=$?
+        echo "$rc" > "${TMP_DIR}/${name}.rc"
+    ) &
+    QUEUED=$((QUEUED + 1))
+    if (( QUEUED % JOBS == 0 )); then
+        wait
+    fi
 }
 
-render "$CHART_DIR" default
-render "$CHART_DIR" logs_on "${OTEL[@]}"
-render "$CHART_DIR" logs_off "${OTEL[@]}" "${LOGS_OFF[@]}"
-render "$CHART_DIR" logs_on_tuned "${OTEL[@]}" "${OFF_TUNED[@]}"
-render "$CHART_DIR" logs_off_tuned "${OTEL[@]}" "${LOGS_OFF[@]}" "${OFF_TUNED[@]}"
-render "$CHART_DIR" logs_on_surge "${OTEL[@]}" "${MAX_SURGE_1[@]}"
-render "$CHART_DIR" info_logs_on "${OTEL[@]}" "${INFO[@]}"
-render "$CHART_DIR" info_logs_off "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}"
-render "$CHART_DIR" info_storage_logs_on "${OTEL[@]}" "${INFO[@]}" "${STORAGE_ON[@]}"
-render "$CHART_DIR" info_storage_logs_off "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" "${STORAGE_ON[@]}"
-render "$CHART_DIR" vllm_off "${OTEL[@]}" --set otelContainerInsights.solutions.vllm.enabled=false
-render "$CHART_DIR" info_vllm_off "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.enabled=false
-render "$CHART_DIR" info_otel_off "${INFO[@]}"
-render "$CHART_DIR" storage_only "${OTEL[@]}" "${STORAGE_ON[@]}"
-render "$CHART_DIR" storage_only_logs_off "${OTEL[@]}" "${LOGS_OFF[@]}" "${STORAGE_ON[@]}"
-render "$CHART_DIR" emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.metricResolution=20s
-render "$CHART_DIR" emit_15s "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=15s
-render "$CHART_DIR" emit_1h "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=1h
-# The logs-off poll interval: configInfo.pollInterval as is, or min(2s, effective emit interval).
-POLL_10S=(--set otelContainerInsights.solutions.vllm.configInfo.pollInterval=10s)
-render "$CHART_DIR" poll_emit_1s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=1s
-render "$CHART_DIR" poll_emit_5s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=5s
-render "$CHART_DIR" poll_emit_2m "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=2m
-render "$CHART_DIR" poll_resolution_1s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.metricResolution=1s
-render "$CHART_DIR" poll_emit_5s_logs_on "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=5s
-render "$CHART_DIR" poll_set_10s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" "${POLL_10S[@]}"
-render "$CHART_DIR" poll_set_10s_emit_5s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" "${POLL_10S[@]}" \
-    --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=5s
-render "$CHART_DIR" poll_set_10s_logs_on "${OTEL[@]}" "${INFO[@]}" "${POLL_10S[@]}"
-for bad in 500ms 0s; do
-    render "$CHART_DIR" "poll_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set "otelContainerInsights.solutions.vllm.configInfo.pollInterval=${bad}"
-done
-# pollInterval has no effect with logs on, but a bad value still fails while configInfo is on.
-render "$CHART_DIR" poll_bad_500ms_logs_on "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.pollInterval=500ms
-for bad in 15 0s 25h 1m30s abc; do
-    render "$CHART_DIR" "emit_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" --set "otelContainerInsights.solutions.vllm.configInfo.emitInterval=${bad}"
-done
-# emitInterval empty: the metricResolution fallback is out of the connector's bounds.
-render "$CHART_DIR" emit_bad_resolution "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.metricResolution=90000s
-render "$CHART_DIR" bad_max_state_bytes "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxStateBytes=1000
-render "$CHART_DIR" bad_max_value_length "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxValueLength=2000
-render "$CHART_DIR" bad_max_entities "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxEntities=0
-render "$CHART_DIR" bad_host_path "${OTEL[@]}" "${STORAGE_ON[@]}" --set otelContainerInsights.stateStorage.hostPath=relative/dir
-render "$CHART_DIR" surge_info "${OTEL[@]}" "${INFO[@]}" "${MAX_SURGE_1[@]}"
-render "$CHART_DIR" surge_info_logs_off "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" "${MAX_SURGE_1[@]}"
-render "$CHART_DIR" surge_storage "${OTEL[@]}" "${STORAGE_ON[@]}" "${MAX_SURGE_1[@]}"
-render "$CHART_DIR" surge_agents_entry "${OTEL[@]}" "${INFO[@]}" \
-    --set 'agents[0].name=cloudwatch-agent' \
-    --set 'agents[0].updateStrategy.type=RollingUpdate' \
-    --set 'agents[0].updateStrategy.rollingUpdate.maxUnavailable=0' \
-    --set 'agents[0].updateStrategy.rollingUpdate.maxSurge=10%' \
-    --set 'agents[1].name=cloudwatch-agent-cluster-scraper' \
-    --set 'agents[1].mode=deployment' \
-    --set 'agents[1].config=default'
-render "$CHART_DIR" surge_on_delete "${OTEL[@]}" "${INFO[@]}" --set agent.updateStrategy.type=OnDelete
-
-# The chart at BASE_REF, for the byte-identity check.
+# The chart at BASE_REF, for the byte-identity checks.
 BASE_STATUS="skipped: set BASE_REF (for example BASE_REF=origin/main) to compare"
 if [[ -n "$BASE_REF" ]]; then
     BASE_STATUS="unresolved"
@@ -145,15 +111,79 @@ if [[ -n "$BASE_REF" ]]; then
         mkdir -p "${TMP_DIR}/base"
         # From the top level: run in a subdirectory, git archive keeps only that subdirectory.
         git -C "$TOP" archive --format=tar "${BASE_REF}:${PREFIX%/}" | tar -x -C "${TMP_DIR}/base"
-        render "${TMP_DIR}/base" base_default
-        render "${TMP_DIR}/base" base_logs_on "${OTEL[@]}"
-        render "${TMP_DIR}/base" base_logs_off "${OTEL[@]}" "${LOGS_OFF[@]}"
-        render "${TMP_DIR}/base" base_logs_on_tuned "${OTEL[@]}" "${OFF_TUNED[@]}"
         BASE_STATUS="ok"
     fi
 fi
 
-python3 - "${TMP_DIR}" "${BASE_REF}" "${BASE_STATUS}" <<'PY'
+# Logs on.
+render "$CHART_DIR" default
+render "$CHART_DIR" logs_on "${OTEL[@]}"
+render "$CHART_DIR" logs_on_tuned "${OTEL[@]}" "${OFF_TUNED[@]}"
+render "$CHART_DIR" logs_on_surge "${OTEL[@]}" "${MAX_SURGE_1[@]}"
+render "$CHART_DIR" info_logs_on "${OTEL[@]}" "${INFO[@]}"
+render "$CHART_DIR" info_storage_logs_on "${OTEL[@]}" "${INFO[@]}" "${STORAGE_ON[@]}"
+render "$CHART_DIR" vllm_off "${OTEL[@]}" --set "${CI}.solutions.vllm.enabled=false"
+render "$CHART_DIR" info_vllm_off "${OTEL[@]}" "${INFO[@]}" --set "${CI}.solutions.vllm.enabled=false"
+render "$CHART_DIR" solutions_off "${OTEL[@]}" --set "${CI}.solutions.enabled=false"
+render "$CHART_DIR" info_solutions_off "${OTEL[@]}" "${INFO[@]}" --set "${CI}.solutions.enabled=false"
+render "$CHART_DIR" info_otel_off "${INFO[@]}"
+render "$CHART_DIR" storage_only "${OTEL[@]}" "${STORAGE_ON[@]}"
+render "$CHART_DIR" emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set "${CI}.metricResolution=20s"
+render "$CHART_DIR" emit_15s "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=15s"
+render "$CHART_DIR" emit_1h "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=1h"
+for bad in 15 0s 25h 1m30s abc; do
+    render "$CHART_DIR" "emit_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=${bad}"
+done
+# emitInterval empty: the metricResolution fallback is out of the connector's bounds.
+render "$CHART_DIR" emit_bad_resolution "${OTEL[@]}" "${INFO[@]}" --set "${CI}.metricResolution=90000s"
+render "$CHART_DIR" bad_max_state_bytes "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxStateBytes=1000"
+render "$CHART_DIR" bad_max_value_length "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxValueLength=2000"
+render "$CHART_DIR" bad_max_entities "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxEntities=0"
+render "$CHART_DIR" bad_host_path "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=relative/dir"
+render "$CHART_DIR" surge_info "${OTEL[@]}" "${INFO[@]}" "${MAX_SURGE_1[@]}"
+render "$CHART_DIR" surge_storage "${OTEL[@]}" "${STORAGE_ON[@]}" "${MAX_SURGE_1[@]}"
+render "$CHART_DIR" surge_agents_entry "${OTEL[@]}" "${INFO[@]}" "${AGENTS_SURGE_10[@]}"
+render "$CHART_DIR" surge_on_delete "${OTEL[@]}" "${INFO[@]}" --set agent.updateStrategy.type=OnDelete
+
+# Logs off. logs_off_set <name> <description> [helm args...] renders lo_<name>_info
+# (configInfo on) and lo_<name>_plain (configInfo off), both with logs off and the
+# args, and base_lo_<name>_info: the chart at BASE_REF with the values of lo_<name>_info.
+: > "${TMP_DIR}/logs_off_sets"
+logs_off_set() {
+    local name="$1" desc="$2"
+    shift 2
+    printf '%s\t%s\n' "$name" "$desc" >> "${TMP_DIR}/logs_off_sets"
+    render "$CHART_DIR" "lo_${name}_info" "${OTEL[@]}" "${LOGS_OFF[@]}" "${INFO[@]}" "$@"
+    render "$CHART_DIR" "lo_${name}_plain" "${OTEL[@]}" "${LOGS_OFF[@]}" "$@"
+    if [[ "$BASE_STATUS" == "ok" ]]; then
+        render "${TMP_DIR}/base" "base_lo_${name}_info" "${OTEL[@]}" "${LOGS_OFF[@]}" "${INFO[@]}" "$@"
+    fi
+}
+logs_off_set defaults "the defaults"
+logs_off_set tuned "emitInterval, caps and hostPath changed" "${OFF_TUNED[@]}"
+logs_off_set out_of_bounds "every new setting out of its bounds" "${OUT_OF_BOUNDS[@]}"
+logs_off_set storage "stateStorage on" "${STORAGE_ON[@]}"
+logs_off_set storage_tuned "stateStorage on, emitInterval, caps and hostPath changed" \
+    "${STORAGE_ON[@]}" "${OFF_TUNED[@]}"
+logs_off_set storage_out_of_bounds "stateStorage on, every new setting out of its bounds" \
+    "${STORAGE_ON[@]}" "${OUT_OF_BOUNDS[@]}"
+logs_off_set surge "agent maxSurge 1" "${MAX_SURGE_1[@]}"
+logs_off_set storage_surge "stateStorage on, agent maxSurge 1" "${STORAGE_ON[@]}" "${MAX_SURGE_1[@]}"
+logs_off_set agents_surge "agents[] entry maxSurge 10%" "${AGENTS_SURGE_10[@]}"
+logs_off_set metric_resolution "metricResolution 20s" --set "${CI}.metricResolution=20s"
+logs_off_set vllm_off "the vLLM solution off" --set "${CI}.solutions.vllm.enabled=false"
+
+if [[ "$BASE_STATUS" == "ok" ]]; then
+    render "${TMP_DIR}/base" base_default
+    render "${TMP_DIR}/base" base_logs_on "${OTEL[@]}"
+    render "${TMP_DIR}/base" base_logs_off "${OTEL[@]}" "${LOGS_OFF[@]}"
+    render "${TMP_DIR}/base" base_logs_on_tuned "${OTEL[@]}" "${OFF_TUNED[@]}"
+    render "${TMP_DIR}/base" base_logs_off_tuned "${OTEL[@]}" "${LOGS_OFF[@]}" "${OFF_TUNED[@]}"
+fi
+wait
+
+python3 - "${TMP_DIR}" "${BASE_REF}" "${BASE_STATUS}" "${VLLM_RULE_FILE}" <<'PY'
+import functools
 import json
 import os
 import re
@@ -161,7 +191,10 @@ import sys
 
 import yaml
 
-TMP, BASE_REF, BASE_STATUS = sys.argv[1], sys.argv[2], sys.argv[3]
+# The C loader when PyYAML has it: the checks parse each render several times.
+LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+TMP, BASE_REF, BASE_STATUS, RULE_FILE = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 AGENT = "cloudwatch-agent"
 SCRAPER = "cloudwatch-agent-cluster-scraper"
@@ -180,6 +213,8 @@ LIVE = "filter/cw_k8s_ci_v0_vllm_info_live"
 CLEANUP = "transform/cw_k8s_ci_v0_vllm_info_cleanup"
 PREFILTER = "filter/cw_k8s_ci_v0_vllm_info_prefilter"
 INFO_PROCESSORS = (UID_SET_ASIDE, LIVE, CLEANUP)
+# Everything that the Info metric or the storage adds to an otelConfig.
+ADDED = (CONNECTOR, STORAGE, PREFILTER) + INFO_PROCESSORS
 INFO_METRIC = "vllm_engine_config_info"
 # The private resource attribute that holds the stored UID between the transforms.
 STORED_UID = "cwagent.info.pod.uid"
@@ -190,27 +225,17 @@ BODY_CONTAINS = ["Initializing an LLM engine (v", "Initializing a V0 LLM engine 
 IDENTITY = ["k8s.namespace.name", "k8s.pod.name", "k8s.container.name"]
 # Copied to the emitted resource: the identity and the UID of the pod that logged the line.
 INCLUDED = IDENTITY + ["k8s.pod.uid"]
-# Logs-off mode: the receiver reads /var/log/pods/<namespace>_<pod>_<uid>/<container>/<n>.log.
-PODS_INCLUDE = ["/var/log/pods/*/*/*.log"]
-PODS_EXCLUDE = [f"/var/log/pods/*_{p}*/*/*.log" for p in ("cloudwatch-agent", "fluent-bit", "aws-node", "kube-proxy")]
-PODS_REGEX = (r"^/var/log/pods/(?P<namespace>[^_/]+)_(?P<pod>[^_/]+)_(?:(?P<uid>[0-9a-f]{8}-[0-9a-f]{4}"
-              r"-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|[^/]+)/(?P<container>[^/]+)/[0-9]+\.log$")
-# The parse result depends only on the path, so logs-off mode caches it per path.
-PODS_CACHE_SIZE = 1024
-PODS_PARSER = {"type": "regex_parser", "id": "extract_metadata_from_filepath", "regex": PODS_REGEX,
-               "parse_from": 'attributes["log.file.path"]', "parse_to": "resource",
-               "cache": {"size": PODS_CACHE_SIZE}}
-# Logs-off mode skips the UTF-8 check: nothing is shipped, and the connector replaces
-# invalid UTF-8 in the values that it emits.
-LOGS_OFF_ENCODING = "utf8-raw"
-UID_MOVE = {"type": "move", "from": "resource.uid", "to": 'resource["k8s.pod.uid"]', "on_error": "send_quiet"}
-# Every mode the checks below look at, for the component cross-checks.
-MODES = ("default", "logs_on", "logs_off", "logs_on_tuned", "logs_off_tuned", "info_logs_on",
-         "info_logs_off", "info_storage_logs_on", "info_storage_logs_off", "storage_only",
-         "storage_only_logs_off", "vllm_off", "info_vllm_off", "info_otel_off",
-         "emit_metric_resolution", "emit_15s", "emit_1h", "poll_emit_1s", "poll_emit_5s",
-         "poll_emit_2m", "poll_resolution_1s", "poll_emit_5s_logs_on", "poll_set_10s",
-         "poll_set_10s_emit_5s", "poll_set_10s_logs_on", "surge_on_delete")
+
+with open(os.path.join(TMP, "logs_off_sets")) as f:
+    LOGS_OFF_SETS = [tuple(line.rstrip("\n").split("\t", 1)) for line in f if line.strip()]
+LOGS_OFF = "lo_defaults_plain"
+LOGS_OFF_TUNED = "lo_tuned_plain"
+LOGS_OFF_RENDERS = tuple(f"lo_{n}_{k}" for n, _ in LOGS_OFF_SETS for k in ("info", "plain"))
+# Every render that must succeed, for the render guard and the component cross-checks.
+MODES = ("default", "logs_on", "logs_on_tuned", "logs_on_surge", "info_logs_on",
+         "info_storage_logs_on", "vllm_off", "info_vllm_off", "solutions_off",
+         "info_solutions_off", "info_otel_off", "storage_only", "emit_metric_resolution",
+         "emit_15s", "emit_1h", "surge_on_delete") + LOGS_OFF_RENDERS
 
 GREEN, RED, YELLOW, RESET = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
 passed = failed = 0
@@ -227,6 +252,10 @@ def check(desc, ok):
     return ok
 
 
+def skip(desc):
+    print(f"  {YELLOW}SKIP{RESET}: {desc}")
+
+
 def path(name):
     return os.path.join(TMP, name)
 
@@ -241,18 +270,22 @@ def err(name):
         return f.read()
 
 
+@functools.lru_cache(maxsize=None)
 def docs(name):
+    """The parsed documents of a render, cached. No check changes them."""
     with open(path(name + ".yaml")) as f:
-        return [d for d in yaml.safe_load_all(f) if d]
+        return [d for d in yaml.load_all(f, Loader=LOADER) if d]
 
 
 def agent_crs(name):
     return {d["metadata"]["name"]: d for d in docs(name) if d.get("kind") == "AmazonCloudWatchAgent"}
 
 
+@functools.lru_cache(maxsize=None)
 def otel_config(name, agent=AGENT):
+    """The parsed otelConfig of an agent CR, cached. No check changes it."""
     cr = agent_crs(name).get(agent)
-    return (yaml.safe_load(cr["spec"].get("otelConfig") or "{}") or {}) if cr else {}
+    return (yaml.load(cr["spec"].get("otelConfig") or "{}", Loader=LOADER) or {}) if cr else {}
 
 
 def pipelines(cfg):
@@ -271,6 +304,11 @@ def redacted(name):
     """Rendered text with the randomly generated certificate material blanked."""
     with open(path(name + ".yaml")) as f:
         return re.sub(r"(?m)^(\s*(?:caBundle|ca\.crt|tls\.crt|tls\.key):).*$", r"\1 <redacted>", f.read())
+
+
+def same_render(a, b):
+    """Both render, and byte for byte the same (certificates redacted)."""
+    return rc(a) == 0 and rc(b) == 0 and redacted(a) == redacted(b)
 
 
 def mounts(cr, name):
@@ -334,21 +372,8 @@ def file_name_attributes(cfg, file_path):
         src = re.fullmatch(r"resource\.(\w+)", o.get("from") or "")
         dst = re.fullmatch(r'resource\["([^"]+)"\]', o.get("to") or "")
         if src and dst and src.group(1) in m.groupdict():
-            # Go gives "" for a group that took no part in the match, Python gives None.
-            out[dst.group(1)] = m.group(src.group(1)) or ""
+            out[dst.group(1)] = m.group(src.group(1))
     return out
-
-
-def glob_match(pattern, path):
-    """doublestar.PathMatch, as the file matcher applies include and exclude, for the globs
-    used here: * matches any run of characters other than /."""
-    return re.fullmatch("".join("[^/]*" if c == "*" else re.escape(c) for c in pattern), path) is not None
-
-
-def selects(receiver, path):
-    """True if the receiver's include and exclude globs select path."""
-    return (any(glob_match(g, path) for g in receiver.get("include") or []) and
-            not any(glob_match(g, path) for g in receiver.get("exclude") or []))
 
 
 def mentions(cfg, component):
@@ -361,6 +386,15 @@ def mentions(cfg, component):
                for k in ("receivers", "processors", "exporters"))
 
 
+def nothing_added(name):
+    """No agent CR of the render has a connector, the storage, an Info metric processor,
+    or the state volume."""
+    crs = agent_crs(name)
+    return (bool(crs) and
+            not any(mentions(otel_config(name, a), x) for a in crs for x in ADDED) and
+            not any(volumes(cr, "otelstate") or mounts(cr, "otelstate") for cr in crs.values()))
+
+
 def connector_users(cfg):
     as_exporter = [n for n, p in pipelines(cfg).items() if CONNECTOR in (p.get("exporters") or [])]
     as_receiver = [n for n, p in pipelines(cfg).items() if CONNECTOR in (p.get("receivers") or [])]
@@ -369,7 +403,6 @@ def connector_users(cfg):
 
 # --- OTTL, as far as the connector rule uses it ------------------------------------
 OTTL_STRING = r'"((?:[^"\\]|\\.)*)"'
-EXTRACT = re.compile(r'ExtractPatterns\(log\.body, ' + OTTL_STRING + r'\)\["v"\]')
 SHAPE = re.compile(r'^ExtractPatterns\(log\.body, ' + OTTL_STRING + r'\)\["v"\]$')
 
 
@@ -462,39 +495,59 @@ OPTIONAL = ["served_model_name", "dtype", "max_seq_len", "tensor_parallel_size",
 
 # Guards: without these, the assertions below could pass on empty input.
 print(f"\n{YELLOW}[renders]{RESET}")
-for name in MODES + ("logs_on_surge", "vllm_off"):
+for name in MODES:
     if not check(f"{name} renders", rc(name) == 0):
         print("    " + err(name).strip().replace("\n", "\n    "))
 check("the node agent CR renders an otelConfig with configInfo on", bool(otel_config("info_logs_on")))
 check(f"{VLLM_PIPELINE} renders with configInfo on", bool(pipeline(otel_config("info_logs_on"), VLLM_PIPELINE)))
+check(f"{len(LOGS_OFF_SETS)} logs-off value sets", len(LOGS_OFF_SETS) >= 5)
 
 # --- 1. Off by default, and inert while off ---------------------------------------
 print(f"\n{YELLOW}[defaults: everything off]{RESET}")
 if BASE_STATUS == "ok":
     for new, base in (("default", "base_default"), ("logs_on", "base_logs_on"),
-                      ("logs_off", "base_logs_off"), ("logs_on_tuned", "base_logs_on_tuned")):
-        check(f"{new} is byte-identical to {BASE_REF} (certificates redacted)",
-              rc(base) == 0 and redacted(new) == redacted(base))
+                      (LOGS_OFF, "base_logs_off"), ("logs_on_tuned", "base_logs_on_tuned"),
+                      (LOGS_OFF_TUNED, "base_logs_off_tuned")):
+        check(f"{new} is byte-identical to {BASE_REF} (certificates redacted)", same_render(new, base))
 elif BASE_REF:
     check(f"BASE_REF {BASE_REF} resolves in this checkout", False)
 else:
-    print(f"  {YELLOW}SKIP{RESET}: byte identity with a base ref ({BASE_STATUS})")
-for tuned, plain in (("logs_on_tuned", "logs_on"), ("logs_off_tuned", "logs_off")):
+    skip(f"byte identity with a base ref ({BASE_STATUS})")
+for tuned, plain in (("logs_on_tuned", "logs_on"), (LOGS_OFF_TUNED, LOGS_OFF)):
     check(f"changing only the new settings, with both flags off, changes nothing ({plain})",
-          redacted(tuned) == redacted(plain))
+          same_render(tuned, plain))
 check("maxSurge 1 renders while the storage is off", rc("logs_on_surge") == 0)
-for name in ("default", "logs_on", "logs_off", "info_vllm_off", "info_otel_off"):
-    everything = [otel_config(name, a) for a in agent_crs(name)]
-    check(f"{name}: no connector, storage extension or Info metric processors",
-          not any(mentions(c, x) for c in everything for x in (CONNECTOR, STORAGE, PREFILTER) + INFO_PROCESSORS))
-    check(f"{name}: no state volume on any agent",
-          not any(volumes(cr, "otelstate") or mounts(cr, "otelstate") for cr in agent_crs(name).values()))
-check("configInfo without the vLLM solution renders as if it were off",
-      redacted("info_vllm_off") == redacted("vllm_off"))
-check("configInfo without OTEL Container Insights renders as the defaults",
-      redacted("info_otel_off") == redacted("default"))
+for name in ("default", "logs_on", LOGS_OFF, "info_vllm_off", "info_solutions_off", "info_otel_off"):
+    check(f"{name}: no connector, storage extension, Info metric processors or state volume",
+          nothing_added(name))
+check("configInfo without the vLLM solution renders as if it were off", same_render("info_vllm_off", "vllm_off"))
+check("configInfo with solutions.enabled false renders as if it were off",
+      same_render("info_solutions_off", "solutions_off"))
+check("configInfo without OTEL Container Insights renders as the defaults", same_render("info_otel_off", "default"))
 
-# --- 2. configInfo on + logs on ----------------------------------------------------
+# --- 2. configInfo on + logs off: the chart renders nothing for it -----------------
+print(f"\n{YELLOW}[configInfo on, logs off: nothing renders for it]{RESET}")
+for set_name, desc in LOGS_OFF_SETS:
+    info, plain = f"lo_{set_name}_info", f"lo_{set_name}_plain"
+    if not check(f"logs off, {desc}: configInfo on is byte-identical to configInfo off", same_render(info, plain)):
+        for n in (info, plain):
+            if rc(n) != 0:
+                print(f"    {n}: " + err(n).strip().replace("\n", "\n    "))
+    check(f"logs off, {desc}: no connector, storage extension, Info metric processors or state volume",
+          nothing_added(info) and nothing_added(plain))
+    if BASE_STATUS == "ok":
+        check(f"logs off, {desc}: configInfo on is byte-identical to {BASE_REF} with the same values",
+              same_render(info, f"base_lo_{set_name}_info"))
+if BASE_STATUS != "ok" and not BASE_REF:
+    skip(f"logs-off byte identity with a base ref ({BASE_STATUS})")
+lo = otel_config("lo_defaults_info")
+check(f"logs off: no {APP_RECEIVER}, {APP_PIPELINE} or {APP_EXPORTER}",
+      bool(lo) and APP_RECEIVER not in section(lo, "receivers") and APP_PIPELINE not in pipelines(lo) and
+      APP_EXPORTER not in section(lo, "exporters"))
+check(f"logs off: {VLLM_PIPELINE} has only its scrape receiver",
+      pipeline(lo, VLLM_PIPELINE).get("receivers") == [VLLM_RECEIVER])
+
+# --- 3. configInfo on + logs on ----------------------------------------------------
 print(f"\n{YELLOW}[configInfo on, logs on]{RESET}")
 on = otel_config("info_logs_on")
 off = otel_config("logs_on")
@@ -507,7 +560,8 @@ check(f"{APP_PIPELINE} still ships logs, then feeds the connector",
       pipeline(on, APP_PIPELINE).get("exporters") == [APP_EXPORTER, CONNECTOR])
 check(f"{VLLM_PIPELINE} keeps its scrape receiver first",
       pipeline(on, VLLM_PIPELINE).get("receivers") == [VLLM_RECEIVER, CONNECTOR])
-check(f"{APP_PIPELINE} processors are unchanged",
+check(f"{APP_PIPELINE} receivers and processors are unchanged",
+      pipeline(on, APP_PIPELINE).get("receivers") == pipeline(off, APP_PIPELINE).get("receivers") == [APP_RECEIVER] and
       pipeline(on, APP_PIPELINE).get("processors") == pipeline(off, APP_PIPELINE).get("processors"))
 check(f"{APP_PIPELINE} runs {POD} before the connector, which adds the k8s.pod.uid the connector stores",
       POD in (pipeline(on, APP_PIPELINE).get("processors") or []))
@@ -537,6 +591,28 @@ check("vllm_engine defaults to V0 and is not also optional (the connector reject
       all(by_key[k].get("default_value") == v and "optional" not in by_key[k] for k, v in DEFAULTED.items()))
 check("every other fact is optional, with no default_value",
       all(by_key[k].get("optional") is True and "default_value" not in by_key[k] for k in OPTIONAL))
+
+# The rule in the connector's testdata, which the connector's own tests run.
+if RULE_FILE:
+    try:
+        with open(RULE_FILE) as f:
+            want_rules = (yaml.safe_load(f) or {}).get("rules")
+    except OSError as e:
+        print(f"    {e}")
+        want_rules = None
+    if not check(f"the rendered rules equal the rules in {RULE_FILE} (both parsed)",
+                 want_rules is not None and connector.get("rules") == want_rules):
+        got_by_key = {a.get("key"): a for a in attrs}
+        want_rule = (want_rules or [{}])[0]
+        for k in sorted(set(rule) | set(want_rule)):
+            if k != "attributes" and rule.get(k) != want_rule.get(k):
+                print(f"    {k}: rendered {rule.get(k)!r}, file {want_rule.get(k)!r}")
+        for a in want_rule.get("attributes") or []:
+            if got_by_key.get(a.get("key")) != a:
+                print(f"    attribute {a.get('key')}: rendered {got_by_key.get(a.get('key'))!r}, file {a!r}")
+else:
+    skip("rules equal the connector testdata (set VLLM_RULE_FILE to "
+         "connector/signaltoinfometricconnector/testdata/vllm_rule.yaml of amazon-cloudwatch-agent)")
 
 # 6. Escaping: run every pattern the way the collector would see it.
 all_ottl = [a.get("value") or "" for a in attrs]
@@ -584,25 +660,18 @@ check(f"configInfo does not change log shipping: {APP_RECEIVER} (no checkpoints,
       "storage" not in (section(on, "receivers").get(APP_RECEIVER) or {"storage": 1}) and
       section(on, "exporters").get(APP_EXPORTER) == section(off, "exporters").get(APP_EXPORTER))
 on_receiver = section(on, "receivers").get(APP_RECEIVER) or {}
-check(f"logs on: {APP_RECEIVER} reads /var/log/containers, with no poll_interval and no k8s.pod.uid move",
-      on_receiver.get("include") == ["/var/log/containers/*.log"] and "poll_interval" not in on_receiver and
-      "include_file_path_resolved" not in on_receiver and
-      not any(o.get("from") == "resource.uid" for o in on_receiver.get("operators") or []))
-on_parsers = [o for o in on_receiver.get("operators") or [] if o.get("type") == "regex_parser"]
-check(f"logs on: {APP_RECEIVER} has no encoding (the utf-8 default), and its regex_parser no cache",
-      "encoding" not in on_receiver and len(on_parsers) == 1 and "cache" not in on_parsers[0])
+check(f"{APP_RECEIVER} reads /var/log/containers and sets no k8s.pod.uid ({POD} adds it)",
+      on_receiver.get("include") == ["/var/log/containers/*.log"] and
+      not any("k8s.pod.uid" in (o.get("to") or "") for o in on_receiver.get("operators") or []))
 
 # 4. Identity and liveness.
-SAMPLE_UID = "5f2c8a1e-3b4d-4e6f-9a0b-1c2d3e4f5a6b"
-SAMPLE_PATHS = {"info_logs_on": "/var/log/containers/vllm-0_ml-serving_vllm-server-" + "0123456789abcdef" * 4 + ".log",
-                "info_logs_off": f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log"}
+SAMPLE_PATH = "/var/log/containers/vllm-0_ml-serving_vllm-server-" + "0123456789abcdef" * 4 + ".log"
 SAMPLE_IDENTITY = {"k8s.pod.name": "vllm-0", "k8s.namespace.name": "ml-serving",
                    "k8s.container.name": "vllm-server"}
-for name, sample_path in SAMPLE_PATHS.items():
-    got = file_name_attributes(otel_config(name), sample_path)
-    if not check(f"{name}: {APP_RECEIVER} sets every identity key from the log file name",
-                 {k: got.get(k) for k in IDENTITY} == SAMPLE_IDENTITY):
-        print(f"    got {got}")
+got = file_name_attributes(on, SAMPLE_PATH)
+if not check(f"{APP_RECEIVER} sets every identity key from the log file name",
+             {k: got.get(k) for k in IDENTITY} == SAMPLE_IDENTITY):
+    print(f"    got {got}")
 chain = pipeline(on, VLLM_PIPELINE).get("processors") or []
 pod_at = chain.index(POD) if POD in chain else -1
 check(f"{UID_SET_ASIDE} runs right before {POD}, and {LIVE} then {CLEANUP} right after it",
@@ -673,185 +742,48 @@ check("the cluster-scraper has no connector or storage",
       not mentions(otel_config("info_logs_on", SCRAPER), CONNECTOR) and
       not mentions(otel_config("info_logs_on", SCRAPER), STORAGE))
 
-# --- 3. configInfo on + logs off ---------------------------------------------------
-print(f"\n{YELLOW}[configInfo on, logs off]{RESET}")
-lo = otel_config("info_logs_off")
-lo_base = otel_config("logs_off")
-check(f"the only pipeline added to the logs-off render is {APP_PIPELINE}",
-      set(pipelines(lo)) == set(pipelines(lo_base)) | {APP_PIPELINE} and APP_PIPELINE not in pipelines(lo_base))
-check(f"{APP_PIPELINE} is {APP_RECEIVER} straight to the connector, with no processors",
-      pipeline(lo, APP_PIPELINE) == {"receivers": [APP_RECEIVER], "exporters": [CONNECTOR]})
-check(f"no {PREFILTER} defined", not mentions(lo, PREFILTER))
-check("the log-shipping processors are not defined",
-      not any(x.startswith(("transform/cw_k8s_ci_v0_logs_", "batch/cw_k8s_ci_v0_logs_"))
-              for x in section(lo, "processors")))
-check(f"{VLLM_PIPELINE} and {', '.join(INFO_PROCESSORS)} are as with logs on",
-      pipeline(lo, VLLM_PIPELINE) == pipeline(on, VLLM_PIPELINE) and
-      all(x in section(lo, "processors") and section(lo, "processors").get(x) == section(on, "processors").get(x)
-          for x in INFO_PROCESSORS))
-check("the connector is the same as with logs on", section(lo, "connectors") == section(on, "connectors"))
-lo_receiver = section(lo, "receivers").get(APP_RECEIVER) or {}
-check(f"{APP_RECEIVER} starts at the beginning (nothing is shipped)", lo_receiver.get("start_at") == "beginning")
-check(f"{APP_RECEIVER} polls every 2s (pollInterval empty, emitInterval 30s, the defaults)",
-      lo_receiver.get("poll_interval") == "2s")
-lo_parsers = [o for o in lo_receiver.get("operators") or [] if o.get("type") == "regex_parser"]
-check(f"{APP_RECEIVER} reads with encoding {LOGS_OFF_ENCODING}, and its regex_parser caches "
-      f"{PODS_CACHE_SIZE} paths",
-      lo_receiver.get("encoding") == LOGS_OFF_ENCODING and len(lo_parsers) == 1 and
-      lo_parsers[0].get("cache") == {"size": PODS_CACHE_SIZE})
-# Every render with the app-log receiver: the encoding and the cache in logs-off mode only.
-by_layout = {"logs off": [], "logs on": []}
-for name in MODES:
-    rec = section(otel_config(name), "receivers").get(APP_RECEIVER)
-    if rec is not None:
-        by_layout["logs off" if rec.get("include") == PODS_INCLUDE else "logs on"].append((name, rec))
-for layout, want in (("logs off", (LOGS_OFF_ENCODING, [{"size": PODS_CACHE_SIZE}])), ("logs on", (None, [None]))):
-    wrong = [name for name, rec in by_layout[layout]
-             if (rec.get("encoding"), [o.get("cache") for o in rec.get("operators") or []
-                                       if o.get("type") == "regex_parser"]) != want]
-    if not check(f"every {layout} render ({len(by_layout[layout])}): {APP_RECEIVER} encoding {want[0]}, "
-                 f"regex_parser cache {want[1][0]}", bool(by_layout[layout]) and not wrong):
-        print(f"    wrong in {wrong}")
-check(f"{APP_RECEIVER} reads /var/log/pods with the logs-on excludes in that layout, and no "
-      "include_file_path_resolved",
-      lo_receiver.get("include") == PODS_INCLUDE and lo_receiver.get("exclude") == PODS_EXCLUDE and
-      "include_file_path_resolved" not in lo_receiver and
-      all(lo_receiver.get(k) == on_receiver.get(k) for k in
-          ("include_file_path", "include_file_name", "max_concurrent_files")))
-on_ops, lo_ops = on_receiver.get("operators") or [], lo_receiver.get("operators") or []
-check(f"{APP_RECEIVER} operators: one /var/log/pods regex_parser, the three logs-on moves, the uid move, "
-      "then container_log_parser, with no if guard",
-      len(on_ops) == 5 and on_ops[-1].get("type") == "container_log_parser" and
-      lo_ops == [PODS_PARSER] + on_ops[1:4] + [UID_MOVE] + on_ops[4:] and not any("if" in o for o in lo_ops))
-# The same containers in both layouts: (namespace, pod, container) -> selected by the excludes?
-CONTAINER_ID = "0123456789abcdef" * 4
-SAMPLE_PODS = (
-    ("amazon-cloudwatch", "cloudwatch-agent-x7k2p", "otc-container", False),
-    ("amazon-cloudwatch", "cloudwatch-agent-cluster-scraper-5d9f-abcde", "otc-container", False),
-    ("amazon-cloudwatch", "fluent-bit-9qz8w", "fluent-bit", False),
-    ("kube-system", "aws-node-4xk2l", "aws-node", False),
-    ("kube-system", "aws-node-4xk2l", "aws-eks-nodeagent", False),
-    ("kube-system", "kube-proxy-p8s7d", "kube-proxy", False),
-    ("ml-serving", "vllm-0", "vllm-server", True),
-    ("cloudwatch-agent-test", "foo", "app", True),
-    ("ml-serving", "my-cloudwatch-agent-1", "app", True),
-    ("ml-serving", "app-0", "cloudwatch-agent", True),
-    ("amazon-cloudwatch", "amazon-cloudwatch-observability-controller-manager-1", "manager", True))
-for ns, pod, container, want in SAMPLE_PODS:
-    pods_path = f"/var/log/pods/{ns}_{pod}_{SAMPLE_UID}/{container}/0.log"
-    containers_path = f"/var/log/containers/{pod}_{ns}_{container}-{CONTAINER_ID}.log"
-    check(f"{ns}/{pod}/{container}: {'read' if want else 'excluded'} in both layouts",
-          selects(lo_receiver, pods_path) == want and selects(on_receiver, containers_path) == want)
-check("rotated and compressed files are not read",
-      not selects(lo_receiver, f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log.20261019-120000") and
-      not selects(lo_receiver, f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log.20261018-1.gz"))
-for desc, pods_path, want in (
-        ("kubelet pod log", f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log",
-         {"k8s.namespace.name": "ml-serving", "k8s.pod.name": "vllm-0", "k8s.container.name": "vllm-server",
-          "k8s.pod.uid": SAMPLE_UID}),
-        ("kubelet pod log after 12 container restarts",
-         f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/12.log",
-         {"k8s.namespace.name": "ml-serving", "k8s.pod.name": "vllm-0", "k8s.container.name": "vllm-server",
-          "k8s.pod.uid": SAMPLE_UID}),
-        ("static pod, kubelet config hash: names, empty UID (no UID check)",
-         "/var/log/pods/kube-system_vllm-static-node1_0123456789abcdef0123456789abcdef/vllm/0.log",
-         {"k8s.namespace.name": "kube-system", "k8s.pod.name": "vllm-static-node1", "k8s.container.name": "vllm",
-          "k8s.pod.uid": ""}),
-        ("rotated file name: no match, as today's regex on a non-matching name",
-         f"/var/log/pods/ml-serving_vllm-0_{SAMPLE_UID}/vllm-server/0.log.20261019-120000", {}),
-        ("a /var/log/containers name: no match", SAMPLE_PATHS["info_logs_on"], {})):
-    got = file_name_attributes(lo, pods_path)
-    if not check(f"pods path, {desc}", got == want):
-        print(f"    got {got!r}")
-check("the pods regex has no $ other than its end anchor (the collector's confmap expands ${...})",
-      PODS_REGEX.count("$") == 1 and PODS_REGEX.endswith("$"))
-check(f"no {APP_EXPORTER}, host-log pipeline, or logs auth extensions",
-      APP_EXPORTER not in section(lo, "exporters") and "logs/cw_k8s_ci_v0_node" not in pipelines(lo) and
-      "filelog/cw_k8s_ci_v0_node" not in section(lo, "receivers") and
-      not any(e in section(lo, "extensions") for e in
-              ("sigv4auth/cw_k8s_ci_v0_logs_dest", "awscloudwatchlogsprovisioner/cw_k8s_ci_v0_logs")))
-check("no exporter other than the metrics destination", list(section(lo, "exporters")) == ["otlphttp/cw_k8s_ci_v0_metrics_dest"])
-lo_crs = agent_crs("info_logs_off")
-lo_node = lo_crs.get(AGENT) or {"spec": {}}
-var_log_paths = sorted(set(re.findall(r"/var/log[^\s'\"]*", json.dumps(lo))))
-check("every path under /var/log in the otelConfig is under /var/log/pods",
-      bool(var_log_paths) and all(p == "/var/log/pods" or p.startswith("/var/log/pods/") for p in var_log_paths))
-check("/var/log/pods is mounted read-only on the node agent",
-      [(m.get("mountPath"), m.get("readOnly")) for m in mounts(lo_node, "criologs")] == [("/var/log/pods", True)] and
-      volumes(lo_node, "criologs") == [{"hostPath": {"path": "/var/log/pods"}, "name": "criologs"}])
-check("/var/log is not mounted on any agent (only /var/log/pods is read)",
-      not any(mounts(cr, "varlog") or volumes(cr, "varlog") for cr in lo_crs.values()))
-check("the state volume is mounted on the node agent", len(mounts(lo_node, "otelstate")) == 1)
-
-
-def without_state(spec):
-    """The CR spec without the otelConfig and the otelstate volume and mount."""
-    out = {k: v for k, v in spec.items() if k != "otelConfig"}
-    for k in ("volumes", "volumeMounts"):
-        out[k] = [x for x in spec.get(k) or [] if x.get("name") != "otelstate"]
-    return out
-
-
-lo_base_node = agent_crs("logs_off").get(AGENT) or {"spec": {}}
-check("the node agent CR differs from the logs-off render with both flags off (byte-identical to "
-      "origin/main) only by the otelConfig and the otelstate volume and mount",
-      without_state(lo_node["spec"]) == without_state(lo_base_node["spec"]) and
-      lo_node["spec"].get("otelConfig") != lo_base_node["spec"].get("otelConfig") and
-      len(volumes(lo_node, "otelstate")) == 1 and not volumes(lo_base_node, "otelstate"))
-check("the other agent CRs are as in the logs-off render with both flags off",
-      {n: cr for n, cr in lo_crs.items() if n != AGENT} ==
-      {n: cr for n, cr in agent_crs("logs_off").items() if n != AGENT})
-check(f"{STORAGE} is in service.extensions", STORAGE in ((lo.get("service") or {}).get("extensions") or []))
-as_exporter, as_receiver = connector_users(lo)
-check("the connector links the two pipelines", as_exporter == [APP_PIPELINE] and as_receiver == [VLLM_PIPELINE])
-
 # --- stateStorage on, configInfo off -----------------------------------------------
 print(f"\n{YELLOW}[stateStorage on, configInfo off]{RESET}")
 so = otel_config("storage_only")
-check(f"{STORAGE} is defined and in service.extensions",
+check(f"logs on: {STORAGE} is defined and in service.extensions",
       STORAGE in section(so, "extensions") and STORAGE in ((so.get("service") or {}).get("extensions") or []))
-check("no connector anywhere", not any(mentions(otel_config("storage_only", a), CONNECTOR) for a in agent_crs("storage_only")))
-check("no Info metric processors, and the vLLM pipeline and keep filter are unchanged",
-      not any(mentions(so, x) for x in (LIVE, CLEANUP, PREFILTER)) and
+check("logs on: no connector anywhere",
+      not any(mentions(otel_config("storage_only", a), CONNECTOR) for a in agent_crs("storage_only")))
+check("logs on: no Info metric processors, and the vLLM pipeline and keep filter are unchanged",
+      not any(mentions(so, x) for x in (LIVE, CLEANUP, UID_SET_ASIDE, PREFILTER)) and
       pipeline(so, VLLM_PIPELINE) == pipeline(off, VLLM_PIPELINE) and
       section(so, "processors").get(KEEP) == section(off, "processors").get(KEEP))
-check("same pipelines as the logs-on render", set(pipelines(so)) == set(pipelines(off)))
+check("logs on: same pipelines as the logs-on render", set(pipelines(so)) == set(pipelines(off)))
 so_crs = agent_crs("storage_only")
-check("the state volume is on the node agent only",
+check("logs on: the state volume is on the node agent only",
       len(mounts(so_crs.get(AGENT) or {"spec": {}}, "otelstate")) == 1 and
       not any(mounts(cr, "otelstate") for name, cr in so_crs.items() if name != AGENT))
-sol = otel_config("storage_only_logs_off")
-check("with logs off, the storage alone does not turn on the app-log pipeline",
-      APP_PIPELINE not in pipelines(sol) and APP_RECEIVER not in section(sol, "receivers") and
-      set(pipelines(sol)) == set(pipelines(lo_base)))
+# With logs off no component uses the storage, so it does not render.
+check("logs off: stateStorage on renders as stateStorage off (no extension, no hostPath)",
+      same_render("lo_storage_plain", LOGS_OFF) and nothing_added("lo_storage_plain"))
+check("logs off: stateStorage on with agent maxSurge 1 renders, as stateStorage off",
+      same_render("lo_storage_surge_plain", "lo_surge_plain"))
 
 # --- app-log checkpoints --------------------------------------------------------------
 print(f"\n{YELLOW}[app-log checkpoints]{RESET}")
-for name, want_storage, want_start, desc in (
-        ("logs_on", None, "end", "logs on, both flags off"),
-        ("info_logs_on", None, "end", "configInfo on, logs on, stateStorage off"),
-        ("info_storage_logs_on", STORAGE, "end", "configInfo on, logs on, stateStorage on"),
-        ("info_logs_off", STORAGE, "beginning", "configInfo on, logs off, stateStorage off"),
-        ("info_storage_logs_off", STORAGE, "beginning", "configInfo on, logs off, stateStorage on"),
-        ("storage_only", STORAGE, "end", "stateStorage only, logs on")):
+for name, want_storage, desc in (
+        ("logs_on", None, "both flags off"),
+        ("info_logs_on", None, "configInfo on, stateStorage off"),
+        ("info_storage_logs_on", STORAGE, "configInfo on, stateStorage on"),
+        ("storage_only", STORAGE, "stateStorage only")):
     cfg = otel_config(name)
     rec = section(cfg, "receivers").get(APP_RECEIVER)
-    got_storage = (rec or {}).get("storage")
-    check(f"{desc}: {APP_RECEIVER} storage {want_storage or 'absent'}, start_at {want_start}",
-          rec is not None and got_storage == want_storage and rec.get("start_at") == want_start and
+    check(f"logs on, {desc}: {APP_RECEIVER} storage {want_storage or 'absent'}, start_at end",
+          rec is not None and rec.get("storage") == want_storage and rec.get("start_at") == "end" and
           (want_storage is None or STORAGE in section(cfg, "extensions")))
-check("stateStorage only, logs off: no app-log receiver to checkpoint",
-      APP_RECEIVER not in section(otel_config("storage_only_logs_off"), "receivers"))
-check("configInfo on, stateStorage on, logs on: the receiver is the one of stateStorage only",
+check("configInfo on, stateStorage on: the receiver is the one of stateStorage only",
       section(otel_config("info_storage_logs_on"), "receivers").get(APP_RECEIVER) ==
       section(so, "receivers").get(APP_RECEIVER))
-check("configInfo on, logs off: stateStorage changes nothing in the otelConfig",
-      otel_config("info_storage_logs_off") == lo)
-for name in ("info_logs_on", "info_storage_logs_on", "info_logs_off", "info_storage_logs_off"):
+for name in ("info_logs_on", "info_storage_logs_on"):
     check(f"{name}: the connector keeps its state in {STORAGE}",
           (section(otel_config(name), "connectors").get(CONNECTOR) or {}).get("storage") == STORAGE)
 
-# --- every mode: every defined component is used, every used one is defined ---------
+# --- every render: every defined component is used, every used one is defined -------
 print(f"\n{YELLOW}[components defined and used]{RESET}")
 for name in MODES:
     for agent in agent_crs(name):
@@ -877,40 +809,14 @@ check('emitInterval "15s" is used as is', emit("emit_15s") == "15s")
 check('emitInterval "1h" is used as is', emit("emit_1h") == "1h")
 
 
-def poll(name):
-    return (section(otel_config(name), "receivers").get(APP_RECEIVER) or {}).get("poll_interval")
-
-
-# The logs-off poll interval is configInfo.pollInterval as is. When that is empty, it is 2s,
-# or the effective emit interval when that is shorter.
-for name, want, desc in (("info_logs_off", "2s", "pollInterval empty, emitInterval 30s (the defaults)"),
-                         ("poll_emit_1s", "1s", "emitInterval 1s"),
-                         ("poll_emit_5s", "2s", "emitInterval 5s"),
-                         ("poll_emit_2m", "2s", "emitInterval 2m"),
-                         ("poll_resolution_1s", "1s", "emitInterval empty, metricResolution 1s"),
-                         ("poll_set_10s", "10s", "pollInterval 10s"),
-                         ("poll_set_10s_emit_5s", "10s", "pollInterval 10s, emitInterval 5s")):
-    check(f"logs off, {desc}: {APP_RECEIVER} poll_interval {want}", poll(name) == want)
-check(f"logs on, emitInterval 5s: {APP_RECEIVER} keeps the receiver default (no poll_interval)",
-      rc("poll_emit_5s_logs_on") == 0 and poll("poll_emit_5s_logs_on") is None and
-      APP_RECEIVER in section(otel_config("poll_emit_5s_logs_on"), "receivers"))
-check(f"logs on, pollInterval 10s: the render is the configInfo-on, logs-on one ({APP_RECEIVER} "
-      "unchanged, no poll_interval)",
-      rc("poll_set_10s_logs_on") == 0 and poll("poll_set_10s_logs_on") is None and
-      redacted("poll_set_10s_logs_on") == redacted("info_logs_on"))
-
-
 def duration_error(setting, value):
-    """The message of otel-container-insights.vllmInfoDuration, shared by emitInterval and pollInterval."""
+    """The message of otel-container-insights.vllmInfoDuration."""
     return (f'{setting} must be a duration in "<N>s", "<N>m" or "<N>h" format between 1s and 24h '
             f'(e.g. "60s", "5m", "1h"), got: {value}')
 
 
 CONFIG_INFO = "otelContainerInsights.solutions.vllm.configInfo"
 for name, setting, value, desc in (
-        ("poll_bad_500ms", f"{CONFIG_INFO}.pollInterval", "500ms", 'logs off, pollInterval "500ms"'),
-        ("poll_bad_0s", f"{CONFIG_INFO}.pollInterval", "0s", 'logs off, pollInterval "0s"'),
-        ("poll_bad_500ms_logs_on", f"{CONFIG_INFO}.pollInterval", "500ms", 'logs on, pollInterval "500ms"'),
         *((f"emit_bad_{bad}", f"{CONFIG_INFO}.emitInterval", bad, f'emitInterval "{bad}"')
           for bad in ("15", "0s", "25h", "1m30s", "abc")),
         ("emit_bad_resolution",
@@ -925,17 +831,20 @@ for name, setting in (("bad_max_state_bytes", "maxStateBytes"), ("bad_max_value_
           rc(name) != 0 and f"configInfo.{setting}" in err(name))
 check("a relative stateStorage.hostPath fails the render",
       rc("bad_host_path") != 0 and "stateStorage.hostPath" in err("bad_host_path"))
+check("logs off: no new setting is checked, as none takes effect (out-of-bounds values render)",
+      rc("lo_out_of_bounds_info") == 0 and rc("lo_storage_out_of_bounds_info") == 0)
 
 # --- maxSurge guard ------------------------------------------------------------------
 print(f"\n{YELLOW}[maxSurge guard]{RESET}")
 for name, desc in (("surge_info", "configInfo on, agent maxSurge 1"),
-                   ("surge_info_logs_off", "configInfo on, logs off, agent maxSurge 1"),
                    ("surge_storage", "stateStorage on, agent maxSurge 1"),
                    ("surge_agents_entry", "configInfo on, agents[] entry maxSurge 10%")):
-    check(f"{desc}: fails the render with a maxSurge message",
+    check(f"logs on, {desc}: fails the render with a maxSurge message",
           rc(name) != 0 and "maxSurge 0" in err(name))
 check("OnDelete has no surge and renders", rc("surge_on_delete") == 0)
 check("the cluster-scraper Deployment's 25% maxSurge does not trip the guard", rc("info_logs_on") == 0)
+check("logs off: no storage, so maxSurge 1 or 10% renders with configInfo on and with stateStorage on",
+      all(rc(f"lo_{n}_{k}") == 0 for n in ("surge", "storage_surge", "agents_surge") for k in ("info", "plain")))
 
 total = passed + failed
 print("\n=== Summary ===")

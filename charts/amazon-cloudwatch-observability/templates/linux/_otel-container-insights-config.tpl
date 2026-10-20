@@ -1,24 +1,13 @@
 {{- define "otel-container-insights.config" -}}
-{{- /* Shipping logs to CloudWatch Logs. */ -}}
-{{- $logs := .Values.otelContainerInsights.logs.enabled -}}
-{{- /* The vLLM config Info metric: signal_to_info_metric/cw_k8s_ci_v0_vllm. */ -}}
+{{- /* The vLLM config Info metric: signal_to_info_metric/cw_k8s_ci_v0_vllm. Off unless
+otelContainerInsights.logs.enabled is true. */ -}}
 {{- $configInfo := eq (include "otel-container-insights.configInfoEnabled" .) "true" -}}
-{{- /* configInfo.pollInterval takes effect only in logs-off mode, but a bad value fails
-whenever configInfo is on. */ -}}
-{{- if $configInfo -}}
-  {{- $_ := include "otel-container-insights.vllmInfoPollInterval" . -}}
-{{- end -}}
 {{- /* file_storage/cw_k8s_ci_v0_state. */ -}}
 {{- $stateStorage := eq (include "otel-container-insights.stateStorageEnabled" .) "true" -}}
-{{- /* filelog/cw_k8s_ci_v0_app and logs/cw_k8s_ci_v0_app: for shipping logs, the Info metric, or both. */ -}}
-{{- $appLogs := eq (include "otel-container-insights.appLogsPipelineEnabled" .) "true" -}}
-{{- /* Logs-off mode: the app-log pipeline runs only to feed the Info metric connector. */ -}}
-{{- $infoOnlyLogs := and $configInfo (not $logs) -}}
-{{- /* File checkpoints of filelog/cw_k8s_ci_v0_app in file_storage/cw_k8s_ci_v0_state. While logs
-are shipped, only with an explicit stateStorage.enabled, so that configInfo does not change log
-shipping. Always in logs-off mode: without them, start_at: beginning rereads every file at each
-agent restart. */ -}}
-{{- $appLogCheckpoints := or $infoOnlyLogs (and $logs .Values.otelContainerInsights.stateStorage.enabled) -}}
+{{- /* File checkpoints of filelog/cw_k8s_ci_v0_app in file_storage/cw_k8s_ci_v0_state: only with
+an explicit stateStorage.enabled, so that configInfo does not change log shipping. The storage
+renders only with logs on, so the checkpoints do too. */ -}}
+{{- $appLogCheckpoints := and $stateStorage .Values.otelContainerInsights.stateStorage.enabled -}}
 extensions:
   sigv4auth/cw_k8s_ci_v0_metrics_dest:
     region: {{ .Values.region }}
@@ -316,10 +305,9 @@ receivers:
       k8s.node.uptime:
         enabled: true
 
-{{- if $appLogs }}
+{{- if .Values.otelContainerInsights.logs.enabled }}
   # ── CI Logs receivers ──
   filelog/cw_k8s_ci_v0_app:
-    {{- if $logs }}
     include:
       - /var/log/containers/*.log
     exclude:
@@ -329,85 +317,26 @@ receivers:
       # FluentBit's existing Exclude_Path behavior.
       - /var/log/containers/aws-node*
       - /var/log/containers/kube-proxy*
-    {{- else }}
-    # Logs-off mode reads the kubelet's pod log files,
-    # /var/log/pods/<namespace>_<pod>_<uid>/<container>/<restart count>.log, so the
-    # path also gives the pod UID. These are the files that the /var/log/containers
-    # links point to (with the Docker runtime, they are links themselves). *.log skips
-    # the rotated files, as with logs on. The excludes are the logs-on ones: a pod name
-    # that starts with these words, in any namespace (a name has no underscore, and
-    # * does not match a /).
-    include:
-      - /var/log/pods/*/*/*.log
-    exclude:
-      - /var/log/pods/*_cloudwatch-agent*/*/*.log
-      - /var/log/pods/*_fluent-bit*/*/*.log
-      - /var/log/pods/*_aws-node*/*/*.log
-      - /var/log/pods/*_kube-proxy*/*/*.log
-    {{- end }}
     {{- if $appLogCheckpoints }}
     # File checkpoints persist in file_storage/cw_k8s_ci_v0_state, so a restarted
     # agent resumes each file where it stopped, including lines written while it was
-    # down. While logs are shipped, only with otelContainerInsights.stateStorage.enabled
-    # (configInfo alone does not change log shipping). Always in logs-off mode.
+    # down. Only with otelContainerInsights.stateStorage.enabled (configInfo alone
+    # does not change log shipping).
     storage: file_storage/cw_k8s_ci_v0_state
     {{- else }}
     # No checkpoint persistence — logs during agent downtime are lost.
     # otelContainerInsights.stateStorage.enabled persists the checkpoints.
     {{- end }}
-    {{- if $logs }}
     start_at: end
-    {{- else }}
-    # No logs are shipped in this mode. Only the connector reads the records, so reading
-    # the current file of each container from the start is safe. It finds the startup
-    # line of a running vLLM engine if that line is still in the current file (kubelet
-    # rotates at 10 MiB, and rotated files are not read). Checkpoints keep a restart
-    # from rereading.
-    start_at: beginning
-    # Only the startup lines matter in this mode, and the connector emits a new series
-    # as soon as it reads one, so the first series comes within one poll. The poll is
-    # configInfo.pollInterval, or 2s (or the emit interval, when that is shorter) when
-    # it is empty: fewer checkpoint writes and file stats than the 200ms default. A poll
-    # above 2s can miss the startup line of a pod whose log rotates within seconds of
-    # its start.
-    poll_interval: {{ include "otel-container-insights.vllmInfoLogsOffPollInterval" . }}
-    # Raw UTF-8 does not check each line for invalid UTF-8 bytes or replace them, which
-    # cut the agent CPU by 7 percent in a test at 20,000 lines/s. This is safe here: no
-    # log is shipped in this mode, and the connector replaces invalid UTF-8 in each value
-    # that it emits.
-    encoding: utf8-raw
-    {{- end }}
     include_file_path: true
     include_file_name: false
     max_concurrent_files: 100
     operators:
-      {{- if $logs }}
       - type: regex_parser
         id: extract_metadata_from_filepath
         regex: '^.*\/(?P<pod>[^_]+)_(?P<namespace>[^_]+)_(?P<container>.+)-[a-f0-9]{64}\.log$'
         parse_from: attributes["log.file.path"]
         parse_to: resource
-      {{- else }}
-      # One parse gives the three names and the pod UID. uid takes only the API UUID
-      # form. Any other directory suffix, such as the kubelet's config hash of a static
-      # pod (whose mirror pod has another UID in the API), leaves uid empty, and the
-      # connector stores no empty value, so that series has no UID check.
-      # The parse result is the same for every line of a file, so the parser caches it. In
-      # a test at 20,000 lines/s, this cut the agent CPU by 30 percent, with the same output.
-      # The key is the whole log.file.path value, so the cache holds one entry of about
-      # 0.7 KB for each file read since the agent started, up to 1024 files (cache.size is
-      # a uint16, at most 65535). When the cache is full, each new path removes the oldest
-      # entry, and on amd64 the parser stops adding entries about a minute after the first
-      # removal until the agent restarts, so it then parses every line of a file that is
-      # not in the cache.
-      - type: regex_parser
-        id: extract_metadata_from_filepath
-        regex: '^/var/log/pods/(?P<namespace>[^_/]+)_(?P<pod>[^_/]+)_(?:(?P<uid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|[^/]+)/(?P<container>[^/]+)/[0-9]+\.log$'
-        parse_from: attributes["log.file.path"]
-        parse_to: resource
-        cache:
-          size: 1024
-      {{- end }}
       - type: move
         from: resource.pod
         to: resource["k8s.pod.name"]
@@ -417,21 +346,8 @@ receivers:
       - type: move
         from: resource.container
         to: resource["k8s.container.name"]
-      {{- if $infoOnlyLogs }}
-      # Empty when the parse found no UUID. A regex group that took no part in the
-      # match is an empty string, so this move does not fail when the parse worked.
-      # When the path does not match at all, on_error send_quiet keeps the errors
-      # logged to the ones of the logs-on chain (the parse and the three moves).
-      - type: move
-        from: resource.uid
-        to: resource["k8s.pod.uid"]
-        on_error: send_quiet
-      {{- end }}
       - id: parse_container_log
         type: container_log_parser
-{{- end }}
-
-{{- if $logs }}
 
   filelog/cw_k8s_ci_v0_node:
     include:
@@ -1277,14 +1193,14 @@ connectors:
           - "Initializing a V1 LLM engine (v"
         # The identity comes from the log file name,
         # /var/log/containers/<pod>_<namespace>_<container>-<id>.log, which kubelet
-        # creates and filelog/cw_k8s_ci_v0_app parses, so it is there in every mode
-        # and does not wait for the k8sattributes pod cache. One series per container.
+        # creates and filelog/cw_k8s_ci_v0_app parses, so every record has it and it
+        # does not wait for the k8sattributes pod cache. One series per container.
         # The connector requires every identity key in include_resource_attributes.
         #
-        # k8s.pod.uid is the UID of the pod that logged the startup line: from
-        # k8sattributes/cw_k8s_ci_v0_pod with logs on, and from the /var/log/pods path
-        # in logs-off mode. A record without it stores no UID. A changed included value
-        # counts as changed facts, so a new pod's startup line replaces the stored UID.
+        # k8s.pod.uid is the UID of the pod that logged the startup line, from
+        # k8sattributes/cw_k8s_ci_v0_pod of logs/cw_k8s_ci_v0_app. A record without
+        # it stores no UID. A changed included value counts as changed facts, so a new
+        # pod's startup line replaces the stored UID.
         # filter/cw_k8s_ci_v0_vllm_info_live drops the series while the stored UID is
         # not the UID of the live pod with that name: a pod replaced under the same name
         # (a StatefulSet pod) has no series until its own startup line arrives. It also
@@ -1593,23 +1509,10 @@ service:
       exporters:
         - otlphttp/cw_k8s_ci_v0_metrics_dest
 
-{{- if $appLogs }}
+{{- if .Values.otelContainerInsights.logs.enabled }}
     # ── CI Logs pipelines ──
-    # Ships application logs (logs.enabled), feeds the vLLM config Info metric
-    # connector (solutions.vllm.configInfo.enabled), or both. The connector keys on the
-    # k8s.namespace.name, k8s.pod.name and k8s.container.name that the receiver parses
-    # from the log file name. It also stores k8s.pod.uid: with logs on, the
-    # k8sattributes/cw_k8s_ci_v0_pod of this chain adds it, and in logs-off mode the
-    # receiver parses it from the /var/log/pods path.
-    #
-    # Logs-off mode has no processors: every record goes straight to the connector.
-    # Its body_contains check is cheap (about 76 ns and no allocations per record),
-    # and every record of a pod must reach it, so that a pod that keeps logging
-    # counts as active in the connector's eviction order. No k8sattributes either:
-    # each pipeline runs its own k8sattributes instance, with its own API watches.
     logs/cw_k8s_ci_v0_app:
       receivers: [filelog/cw_k8s_ci_v0_app]
-      {{- if $logs }}
       processors:
         - transform/cw_k8s_ci_v0_logs_set_cluster_and_node
         - resourcedetection/cw_k8s_ci_v0
@@ -1620,16 +1523,15 @@ service:
         - transform/cw_k8s_ci_v0_logs_clear_schema_url
         - transform/cw_k8s_ci_v0_logs_set_workload
         - batch/cw_k8s_ci_v0_logs_dest
-      {{- end }}
       exporters:
-        {{- if $logs }}
         - otlphttp/cw_k8s_ci_v0_app_logs_dest
-        {{- end }}
         {{- if $configInfo }}
+        # The vLLM config Info metric connector, a second exporter. It keys on the
+        # k8s.namespace.name, k8s.pod.name and k8s.container.name that the receiver
+        # parses from the log file name, and stores the k8s.pod.uid that
+        # k8sattributes/cw_k8s_ci_v0_pod of this chain adds.
         - signal_to_info_metric/cw_k8s_ci_v0_vllm
         {{- end }}
-{{- end }}
-{{- if $logs }}
 
     # ── CI Logs: Host pipeline ──
     # Intentionally omits k8sattributes/pod and set_workload — host logs
