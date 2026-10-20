@@ -482,8 +482,8 @@ true
 
 {{/*
 emit_interval of the vLLM config Info metric: solutions.vllm.configInfo.emitInterval, or
-otelContainerInsights.metricResolution when that is empty. Must be "<N>s", "<N>m" or "<N>h"
-within the connector's 1s..24h bounds, so a bad value fails here rather than at agent start.
+otelContainerInsights.metricResolution when that is empty. Checked by
+otel-container-insights.vllmInfoDuration.
 */}}
 {{- define "otel-container-insights.vllmInfoEmitInterval" -}}
 {{- $configured := .Values.otelContainerInsights.solutions.vllm.configInfo.emitInterval | toString -}}
@@ -493,11 +493,20 @@ within the connector's 1s..24h bounds, so a bad value fails here rather than at 
   {{- $source = "otelContainerInsights.metricResolution (used because solutions.vllm.configInfo.emitInterval is empty)" -}}
   {{- $raw = .Values.otelContainerInsights.metricResolution | toString -}}
 {{- end -}}
-{{- $seconds := include "otel-container-insights.durationSeconds" $raw | int64 -}}
-{{- if or (lt $seconds 1) (gt $seconds 86400) -}}
-  {{- fail (printf "%s must be a duration in \"<N>s\", \"<N>m\" or \"<N>h\" format between 1s and 24h (e.g. \"60s\", \"5m\", \"1h\"), got: %s" $source $raw) -}}
+{{- include "otel-container-insights.vllmInfoDuration" (dict "name" $source "value" $raw) -}}
 {{- end -}}
-{{- $raw -}}
+
+{{/*
+A duration setting of the vLLM config Info metric, returned as is. Must be "<N>s", "<N>m" or
+"<N>h" within the connector's 1s..24h bounds, so a bad value fails here rather than at agent
+start. Takes a dict with "name" (the setting, as named in the message) and "value" (a string).
+*/}}
+{{- define "otel-container-insights.vllmInfoDuration" -}}
+{{- $seconds := include "otel-container-insights.durationSeconds" .value | int64 -}}
+{{- if or (lt $seconds 1) (gt $seconds 86400) -}}
+  {{- fail (printf "%s must be a duration in \"<N>s\", \"<N>m\" or \"<N>h\" format between 1s and 24h (e.g. \"60s\", \"5m\", \"1h\"), got: %s" .name .value) -}}
+{{- end -}}
+{{- .value -}}
 {{- end -}}
 
 {{/*
@@ -513,18 +522,39 @@ The number of seconds in a "<N>s", "<N>m" or "<N>h" duration string, 0 for any o
 {{- end -}}
 
 {{/*
+solutions.vllm.configInfo.pollInterval checked by otel-container-insights.vllmInfoDuration, or
+empty when it is not set. otel-container-insights.config checks it whenever configInfo is on,
+so a bad value fails at once even with logs on, where it has no effect.
+*/}}
+{{- define "otel-container-insights.vllmInfoPollInterval" -}}
+{{- $configured := .Values.otelContainerInsights.solutions.vllm.configInfo.pollInterval | toString -}}
+{{- if ne $configured "" -}}
+  {{- include "otel-container-insights.vllmInfoDuration" (dict "name" "otelContainerInsights.solutions.vllm.configInfo.pollInterval" "value" $configured) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 poll_interval of filelog/cw_k8s_ci_v0_app in logs-off mode (configInfo on, logs.enabled off):
-10s, or the emit interval of the vLLM config Info metric (otel-container-insights.vllmInfoEmitInterval)
-when that is shorter. The connector emits a new entity as soon as it reads the startup line, so
-the first series still comes within the first emit interval after the line is written. Polling
-less often than the receiver default of 200ms cuts the checkpoint writes and the file stats.
+solutions.vllm.configInfo.pollInterval (otel-container-insights.vllmInfoPollInterval), used as
+is. When it is empty: 2s, or the emit interval of the vLLM config Info metric
+(otel-container-insights.vllmInfoEmitInterval) when that is shorter. The connector emits a new
+entity as soon as it reads the startup line, so the first series comes within one poll interval
+after the line is written. Polling less often than the receiver default of 200ms cuts the
+checkpoint writes and the file stats. The default is 2s because a longer interval can miss the
+startup line of a pod whose log rotates within seconds of its start: in a measured sweep, 2s
+found it in 5 of 5 runs, 5s and 10s in 4 of 5.
 */}}
 {{- define "otel-container-insights.vllmInfoLogsOffPollInterval" -}}
-{{- $emit := include "otel-container-insights.vllmInfoEmitInterval" . -}}
-{{- if lt (include "otel-container-insights.durationSeconds" $emit | int64) 10 -}}
-{{- $emit -}}
+{{- $configured := include "otel-container-insights.vllmInfoPollInterval" . -}}
+{{- if ne $configured "" -}}
+  {{- $configured -}}
 {{- else -}}
-10s
+  {{- $emit := include "otel-container-insights.vllmInfoEmitInterval" . -}}
+  {{- if lt (include "otel-container-insights.durationSeconds" $emit | int64) 2 -}}
+    {{- $emit -}}
+  {{- else -}}
+    2s
+  {{- end -}}
 {{- end -}}
 {{- end -}}
 

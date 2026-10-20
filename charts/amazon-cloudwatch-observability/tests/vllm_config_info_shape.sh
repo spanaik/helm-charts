@@ -19,9 +19,12 @@
 #   3. Logs-off mode (configInfo on, logs.enabled off): the app-log pipeline runs only
 #      to feed the connector, ships nothing, and has no processors. Its receiver reads
 #      the kubelet's /var/log/pods files (the same containers as /var/log/containers
-#      with logs on), parses the names and the pod UID from that path in one regex, and
-#      polls every 10s (or every emit interval, when that is shorter). In every mode,
-#      every defined component is used and every used component is defined.
+#      with logs on), parses the names and the pod UID from that path in one regex with
+#      a cache of 1024 paths, reads with encoding utf8-raw, and polls every
+#      configInfo.pollInterval, or every 2s (or every emit interval, when that is
+#      shorter) when it is empty. The logs-on receiver has neither the cache nor the
+#      encoding. In every mode, every defined component is used and every used
+#      component is defined.
 #   4. Identity: the connector keys on the namespace, pod and container that the
 #      app-log receiver parses from the log file name, and also stores the k8s.pod.uid
 #      of the record. Before k8sattributes, that stored UID is set aside. Right after
@@ -59,6 +62,7 @@ STORAGE_ON=(--set otelContainerInsights.stateStorage.enabled=true)
 # Every new setting changed while both new flags stay off: must change nothing.
 OFF_TUNED=(--set otelContainerInsights.stateStorage.hostPath=/var/lib/elsewhere
            --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=15s
+           --set otelContainerInsights.solutions.vllm.configInfo.pollInterval=10s
            --set otelContainerInsights.solutions.vllm.configInfo.maxEntities=7
            --set otelContainerInsights.solutions.vllm.configInfo.maxStateBytes=70000
            --set otelContainerInsights.solutions.vllm.configInfo.maxValueLength=9)
@@ -79,6 +83,7 @@ render "$CHART_DIR" default
 render "$CHART_DIR" logs_on "${OTEL[@]}"
 render "$CHART_DIR" logs_off "${OTEL[@]}" "${LOGS_OFF[@]}"
 render "$CHART_DIR" logs_on_tuned "${OTEL[@]}" "${OFF_TUNED[@]}"
+render "$CHART_DIR" logs_off_tuned "${OTEL[@]}" "${LOGS_OFF[@]}" "${OFF_TUNED[@]}"
 render "$CHART_DIR" logs_on_surge "${OTEL[@]}" "${MAX_SURGE_1[@]}"
 render "$CHART_DIR" info_logs_on "${OTEL[@]}" "${INFO[@]}"
 render "$CHART_DIR" info_logs_off "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}"
@@ -92,14 +97,27 @@ render "$CHART_DIR" storage_only_logs_off "${OTEL[@]}" "${LOGS_OFF[@]}" "${STORA
 render "$CHART_DIR" emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.metricResolution=20s
 render "$CHART_DIR" emit_15s "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=15s
 render "$CHART_DIR" emit_1h "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=1h
-# The logs-off poll interval: min(10s, effective emit interval).
+# The logs-off poll interval: configInfo.pollInterval as is, or min(2s, effective emit interval).
+POLL_10S=(--set otelContainerInsights.solutions.vllm.configInfo.pollInterval=10s)
+render "$CHART_DIR" poll_emit_1s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=1s
 render "$CHART_DIR" poll_emit_5s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=5s
 render "$CHART_DIR" poll_emit_2m "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=2m
-render "$CHART_DIR" poll_resolution_8s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.metricResolution=8s
+render "$CHART_DIR" poll_resolution_1s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set otelContainerInsights.metricResolution=1s
 render "$CHART_DIR" poll_emit_5s_logs_on "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=5s
+render "$CHART_DIR" poll_set_10s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" "${POLL_10S[@]}"
+render "$CHART_DIR" poll_set_10s_emit_5s "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" "${POLL_10S[@]}" \
+    --set otelContainerInsights.solutions.vllm.configInfo.emitInterval=5s
+render "$CHART_DIR" poll_set_10s_logs_on "${OTEL[@]}" "${INFO[@]}" "${POLL_10S[@]}"
+for bad in 500ms 0s; do
+    render "$CHART_DIR" "poll_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" "${LOGS_OFF[@]}" --set "otelContainerInsights.solutions.vllm.configInfo.pollInterval=${bad}"
+done
+# pollInterval has no effect with logs on, but a bad value still fails while configInfo is on.
+render "$CHART_DIR" poll_bad_500ms_logs_on "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.pollInterval=500ms
 for bad in 15 0s 25h 1m30s abc; do
     render "$CHART_DIR" "emit_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" --set "otelContainerInsights.solutions.vllm.configInfo.emitInterval=${bad}"
 done
+# emitInterval empty: the metricResolution fallback is out of the connector's bounds.
+render "$CHART_DIR" emit_bad_resolution "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.metricResolution=90000s
 render "$CHART_DIR" bad_max_state_bytes "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxStateBytes=1000
 render "$CHART_DIR" bad_max_value_length "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxValueLength=2000
 render "$CHART_DIR" bad_max_entities "${OTEL[@]}" "${INFO[@]}" --set otelContainerInsights.solutions.vllm.configInfo.maxEntities=0
@@ -177,15 +195,22 @@ PODS_INCLUDE = ["/var/log/pods/*/*/*.log"]
 PODS_EXCLUDE = [f"/var/log/pods/*_{p}*/*/*.log" for p in ("cloudwatch-agent", "fluent-bit", "aws-node", "kube-proxy")]
 PODS_REGEX = (r"^/var/log/pods/(?P<namespace>[^_/]+)_(?P<pod>[^_/]+)_(?:(?P<uid>[0-9a-f]{8}-[0-9a-f]{4}"
               r"-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|[^/]+)/(?P<container>[^/]+)/[0-9]+\.log$")
+# The parse result depends only on the path, so logs-off mode caches it per path.
+PODS_CACHE_SIZE = 1024
 PODS_PARSER = {"type": "regex_parser", "id": "extract_metadata_from_filepath", "regex": PODS_REGEX,
-               "parse_from": 'attributes["log.file.path"]', "parse_to": "resource"}
+               "parse_from": 'attributes["log.file.path"]', "parse_to": "resource",
+               "cache": {"size": PODS_CACHE_SIZE}}
+# Logs-off mode skips the UTF-8 check: nothing is shipped, and the connector replaces
+# invalid UTF-8 in the values that it emits.
+LOGS_OFF_ENCODING = "utf8-raw"
 UID_MOVE = {"type": "move", "from": "resource.uid", "to": 'resource["k8s.pod.uid"]', "on_error": "send_quiet"}
 # Every mode the checks below look at, for the component cross-checks.
-MODES = ("default", "logs_on", "logs_off", "logs_on_tuned", "info_logs_on", "info_logs_off",
-         "info_storage_logs_on", "info_storage_logs_off", "storage_only", "storage_only_logs_off",
-         "vllm_off", "info_vllm_off", "info_otel_off", "emit_metric_resolution", "emit_15s",
-         "emit_1h", "poll_emit_5s", "poll_emit_2m", "poll_resolution_8s", "poll_emit_5s_logs_on",
-         "surge_on_delete")
+MODES = ("default", "logs_on", "logs_off", "logs_on_tuned", "logs_off_tuned", "info_logs_on",
+         "info_logs_off", "info_storage_logs_on", "info_storage_logs_off", "storage_only",
+         "storage_only_logs_off", "vllm_off", "info_vllm_off", "info_otel_off",
+         "emit_metric_resolution", "emit_15s", "emit_1h", "poll_emit_1s", "poll_emit_5s",
+         "poll_emit_2m", "poll_resolution_1s", "poll_emit_5s_logs_on", "poll_set_10s",
+         "poll_set_10s_emit_5s", "poll_set_10s_logs_on", "surge_on_delete")
 
 GREEN, RED, YELLOW, RESET = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
 passed = failed = 0
@@ -454,8 +479,9 @@ elif BASE_REF:
     check(f"BASE_REF {BASE_REF} resolves in this checkout", False)
 else:
     print(f"  {YELLOW}SKIP{RESET}: byte identity with a base ref ({BASE_STATUS})")
-check("changing only the new settings, with both flags off, changes nothing",
-      redacted("logs_on_tuned") == redacted("logs_on"))
+for tuned, plain in (("logs_on_tuned", "logs_on"), ("logs_off_tuned", "logs_off")):
+    check(f"changing only the new settings, with both flags off, changes nothing ({plain})",
+          redacted(tuned) == redacted(plain))
 check("maxSurge 1 renders while the storage is off", rc("logs_on_surge") == 0)
 for name in ("default", "logs_on", "logs_off", "info_vllm_off", "info_otel_off"):
     everything = [otel_config(name, a) for a in agent_crs(name)]
@@ -562,6 +588,9 @@ check(f"logs on: {APP_RECEIVER} reads /var/log/containers, with no poll_interval
       on_receiver.get("include") == ["/var/log/containers/*.log"] and "poll_interval" not in on_receiver and
       "include_file_path_resolved" not in on_receiver and
       not any(o.get("from") == "resource.uid" for o in on_receiver.get("operators") or []))
+on_parsers = [o for o in on_receiver.get("operators") or [] if o.get("type") == "regex_parser"]
+check(f"logs on: {APP_RECEIVER} has no encoding (the utf-8 default), and its regex_parser no cache",
+      "encoding" not in on_receiver and len(on_parsers) == 1 and "cache" not in on_parsers[0])
 
 # 4. Identity and liveness.
 SAMPLE_UID = "5f2c8a1e-3b4d-4e6f-9a0b-1c2d3e4f5a6b"
@@ -663,7 +692,26 @@ check(f"{VLLM_PIPELINE} and {', '.join(INFO_PROCESSORS)} are as with logs on",
 check("the connector is the same as with logs on", section(lo, "connectors") == section(on, "connectors"))
 lo_receiver = section(lo, "receivers").get(APP_RECEIVER) or {}
 check(f"{APP_RECEIVER} starts at the beginning (nothing is shipped)", lo_receiver.get("start_at") == "beginning")
-check(f"{APP_RECEIVER} polls every 10s (emitInterval 30s, the default)", lo_receiver.get("poll_interval") == "10s")
+check(f"{APP_RECEIVER} polls every 2s (pollInterval empty, emitInterval 30s, the defaults)",
+      lo_receiver.get("poll_interval") == "2s")
+lo_parsers = [o for o in lo_receiver.get("operators") or [] if o.get("type") == "regex_parser"]
+check(f"{APP_RECEIVER} reads with encoding {LOGS_OFF_ENCODING}, and its regex_parser caches "
+      f"{PODS_CACHE_SIZE} paths",
+      lo_receiver.get("encoding") == LOGS_OFF_ENCODING and len(lo_parsers) == 1 and
+      lo_parsers[0].get("cache") == {"size": PODS_CACHE_SIZE})
+# Every render with the app-log receiver: the encoding and the cache in logs-off mode only.
+by_layout = {"logs off": [], "logs on": []}
+for name in MODES:
+    rec = section(otel_config(name), "receivers").get(APP_RECEIVER)
+    if rec is not None:
+        by_layout["logs off" if rec.get("include") == PODS_INCLUDE else "logs on"].append((name, rec))
+for layout, want in (("logs off", (LOGS_OFF_ENCODING, [{"size": PODS_CACHE_SIZE}])), ("logs on", (None, [None]))):
+    wrong = [name for name, rec in by_layout[layout]
+             if (rec.get("encoding"), [o.get("cache") for o in rec.get("operators") or []
+                                       if o.get("type") == "regex_parser"]) != want]
+    if not check(f"every {layout} render ({len(by_layout[layout])}): {APP_RECEIVER} encoding {want[0]}, "
+                 f"regex_parser cache {want[1][0]}", bool(by_layout[layout]) and not wrong):
+        print(f"    wrong in {wrong}")
 check(f"{APP_RECEIVER} reads /var/log/pods with the logs-on excludes in that layout, and no "
       "include_file_path_resolved",
       lo_receiver.get("include") == PODS_INCLUDE and lo_receiver.get("exclude") == PODS_EXCLUDE and
@@ -833,18 +881,44 @@ def poll(name):
     return (section(otel_config(name), "receivers").get(APP_RECEIVER) or {}).get("poll_interval")
 
 
-# The logs-off poll interval is 10s, or the effective emit interval when that is shorter.
-for name, want, desc in (("poll_emit_5s", "5s", "emitInterval 5s"),
-                         ("info_logs_off", "10s", "emitInterval 30s (the default, from metricResolution)"),
-                         ("poll_emit_2m", "10s", "emitInterval 2m"),
-                         ("poll_resolution_8s", "8s", "emitInterval empty, metricResolution 8s")):
+# The logs-off poll interval is configInfo.pollInterval as is. When that is empty, it is 2s,
+# or the effective emit interval when that is shorter.
+for name, want, desc in (("info_logs_off", "2s", "pollInterval empty, emitInterval 30s (the defaults)"),
+                         ("poll_emit_1s", "1s", "emitInterval 1s"),
+                         ("poll_emit_5s", "2s", "emitInterval 5s"),
+                         ("poll_emit_2m", "2s", "emitInterval 2m"),
+                         ("poll_resolution_1s", "1s", "emitInterval empty, metricResolution 1s"),
+                         ("poll_set_10s", "10s", "pollInterval 10s"),
+                         ("poll_set_10s_emit_5s", "10s", "pollInterval 10s, emitInterval 5s")):
     check(f"logs off, {desc}: {APP_RECEIVER} poll_interval {want}", poll(name) == want)
 check(f"logs on, emitInterval 5s: {APP_RECEIVER} keeps the receiver default (no poll_interval)",
       rc("poll_emit_5s_logs_on") == 0 and poll("poll_emit_5s_logs_on") is None and
       APP_RECEIVER in section(otel_config("poll_emit_5s_logs_on"), "receivers"))
-for bad in ("15", "0s", "25h", "1m30s", "abc"):
-    check(f'emitInterval "{bad}" fails the render with a message naming the setting',
-          rc(f"emit_bad_{bad}") != 0 and "configInfo.emitInterval" in err(f"emit_bad_{bad}"))
+check(f"logs on, pollInterval 10s: the render is the configInfo-on, logs-on one ({APP_RECEIVER} "
+      "unchanged, no poll_interval)",
+      rc("poll_set_10s_logs_on") == 0 and poll("poll_set_10s_logs_on") is None and
+      redacted("poll_set_10s_logs_on") == redacted("info_logs_on"))
+
+
+def duration_error(setting, value):
+    """The message of otel-container-insights.vllmInfoDuration, shared by emitInterval and pollInterval."""
+    return (f'{setting} must be a duration in "<N>s", "<N>m" or "<N>h" format between 1s and 24h '
+            f'(e.g. "60s", "5m", "1h"), got: {value}')
+
+
+CONFIG_INFO = "otelContainerInsights.solutions.vllm.configInfo"
+for name, setting, value, desc in (
+        ("poll_bad_500ms", f"{CONFIG_INFO}.pollInterval", "500ms", 'logs off, pollInterval "500ms"'),
+        ("poll_bad_0s", f"{CONFIG_INFO}.pollInterval", "0s", 'logs off, pollInterval "0s"'),
+        ("poll_bad_500ms_logs_on", f"{CONFIG_INFO}.pollInterval", "500ms", 'logs on, pollInterval "500ms"'),
+        *((f"emit_bad_{bad}", f"{CONFIG_INFO}.emitInterval", bad, f'emitInterval "{bad}"')
+          for bad in ("15", "0s", "25h", "1m30s", "abc")),
+        ("emit_bad_resolution",
+         "otelContainerInsights.metricResolution (used because solutions.vllm.configInfo.emitInterval is empty)",
+         "90000s", 'emitInterval empty, metricResolution "90000s"')):
+    if not check(f"{desc} fails the render with the duration message naming the setting",
+                 rc(name) != 0 and duration_error(setting, value) in err(name)):
+        print("    " + err(name).strip().replace("\n", "\n    "))
 for name, setting in (("bad_max_state_bytes", "maxStateBytes"), ("bad_max_value_length", "maxValueLength"),
                       ("bad_max_entities", "maxEntities")):
     check(f"{setting} out of the connector's bounds fails the render",

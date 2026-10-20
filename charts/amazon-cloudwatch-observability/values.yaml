@@ -1255,7 +1255,7 @@ otelContainerInsights:
       ## of its own.
       ## With otelContainerInsights.logs.enabled false, the application-log receiver
       ## still runs, to feed the connector, and ships no logs. It then reads the kubelet
-      ## log files in /var/log/pods, every 10s, or every emitInterval when that is shorter.
+      ## log files in /var/log/pods, every pollInterval.
       ## Requires an agent image with the signal_to_info_metric connector: an older
       ## image fails to start when this is on. Turns on the otelContainerInsights.stateStorage
       ## extension and hostPath for its facts, but not the application-log checkpoints.
@@ -1264,6 +1264,13 @@ otelContainerInsights:
         ## How often each series is re-sent. Empty = otelContainerInsights.metricResolution.
         ## "<N>s", "<N>m" or "<N>h", between 1s and 24h.
         emitInterval: ""
+        ## How often the agent checks the log files. Only applies with
+        ## otelContainerInsights.logs.enabled false. Empty = 2s, or the effective emitInterval
+        ## when that is shorter. "<N>s", "<N>m" or "<N>h", between 1s and 24h. A longer value
+        ## saves CPU on nodes with many quiet pods (about 94 us per log file per poll), but a
+        ## value above 2s can miss the startup line of a pod whose log rotates within seconds
+        ## of its start.
+        pollInterval: ""
         ## Maximum number of vLLM containers tracked per agent (1-100000).
         maxEntities: 500
         ## Maximum size of the stored facts per agent, in bytes (65536-67108864).
