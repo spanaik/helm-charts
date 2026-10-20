@@ -149,10 +149,16 @@ mode the agent always keeps checkpoints in the storage. On its first start it re
 current log file of each container from the beginning. If the startup line of a running engine
 is still in the current file, the agent finds it. Kubelet rotates a log file at 10 MiB by default,
 and the agent does not read rotated files. After a restart the agent continues from where it
-stopped. In this mode the agent checks the log files every 10 seconds. If `emitInterval` is
-shorter, the agent checks them every `emitInterval`. The agent sends a new series as soon as it
-reads the startup line. So the series starts within one `emitInterval` after the engine writes
-the line.
+stopped. In this mode the agent checks the log files every 2 seconds. If `emitInterval` is
+shorter, the agent checks them every `emitInterval`. To use another interval, set
+`configInfo.pollInterval`, in the same format as `emitInterval`. A longer interval uses less
+CPU on a node with many quiet pods, about 94 microseconds for each log file at each check. But
+above 2 seconds, the agent can miss the startup line of a pod whose log file rotates within
+seconds of its start. The agent sends a new series as soon as it reads the startup line. So the
+series starts within one check interval after the engine writes the line.
+
+A new `emitInterval`, `pollInterval` or cap reaches the agent only after its pod restarts,
+because the operator updates the agent configuration, not the pod.
 
 Fargate has no node agent DaemonSet. So a vLLM pod on Fargate gets no Info metric.
 

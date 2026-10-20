@@ -3,6 +3,11 @@
 {{- $logs := .Values.otelContainerInsights.logs.enabled -}}
 {{- /* The vLLM config Info metric: signal_to_info_metric/cw_k8s_ci_v0_vllm. */ -}}
 {{- $configInfo := eq (include "otel-container-insights.configInfoEnabled" .) "true" -}}
+{{- /* configInfo.pollInterval takes effect only in logs-off mode, but a bad value fails
+whenever configInfo is on. */ -}}
+{{- if $configInfo -}}
+  {{- $_ := include "otel-container-insights.vllmInfoPollInterval" . -}}
+{{- end -}}
 {{- /* file_storage/cw_k8s_ci_v0_state. */ -}}
 {{- $stateStorage := eq (include "otel-container-insights.stateStorageEnabled" .) "true" -}}
 {{- /* filelog/cw_k8s_ci_v0_app and logs/cw_k8s_ci_v0_app: for shipping logs, the Info metric, or both. */ -}}
@@ -360,9 +365,11 @@ receivers:
     # from rereading.
     start_at: beginning
     # Only the startup lines matter in this mode, and the connector emits a new series
-    # as soon as it reads one. So polling every 10s (or every emit interval, when that
-    # is shorter) still gives the first series within the first emit interval, with
-    # fewer checkpoint writes and file stats than the 200ms default.
+    # as soon as it reads one, so the first series comes within one poll. The poll is
+    # configInfo.pollInterval, or 2s (or the emit interval, when that is shorter) when
+    # it is empty: fewer checkpoint writes and file stats than the 200ms default. A poll
+    # above 2s can miss the startup line of a pod whose log rotates within seconds of
+    # its start.
     poll_interval: {{ include "otel-container-insights.vllmInfoLogsOffPollInterval" . }}
     {{- end }}
     include_file_path: true
