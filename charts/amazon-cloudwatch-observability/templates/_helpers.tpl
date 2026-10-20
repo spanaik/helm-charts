@@ -479,7 +479,9 @@ otelContainerInsights.metricResolution when that is empty. Checked by
 otel-container-insights.vllmInfoDuration.
 */}}
 {{- define "otel-container-insights.vllmInfoEmitInterval" -}}
-{{- $configured := .Values.otelContainerInsights.solutions.vllm.configInfo.emitInterval | toString -}}
+{{- /* A null value (for example --set ...emitInterval=null) counts as empty. */ -}}
+{{- $value := .Values.otelContainerInsights.solutions.vllm.configInfo.emitInterval -}}
+{{- $configured := ternary "" ($value | toString) (kindIs "invalid" $value) -}}
 {{- $source := "otelContainerInsights.solutions.vllm.configInfo.emitInterval" -}}
 {{- $raw := $configured -}}
 {{- if eq $configured "" -}}

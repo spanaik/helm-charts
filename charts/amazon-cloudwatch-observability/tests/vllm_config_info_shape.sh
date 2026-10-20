@@ -131,6 +131,7 @@ render "$CHART_DIR" storage_only "${OTEL[@]}" "${STORAGE_ON[@]}"
 render "$CHART_DIR" emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set "${CI}.metricResolution=20s"
 render "$CHART_DIR" emit_15s "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=15s"
 render "$CHART_DIR" emit_1h "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=1h"
+render "$CHART_DIR" emit_null "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=null"
 for bad in 15 0s 25h 1m30s abc; do
     render "$CHART_DIR" "emit_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=${bad}"
 done
@@ -239,7 +240,7 @@ LOGS_OFF_RENDERS = tuple(f"lo_{n}_{k}" for n, _ in LOGS_OFF_SETS for k in ("info
 MODES = ("default", "logs_on", "logs_on_tuned", "logs_on_surge", "info_logs_on",
          "info_storage_logs_on", "vllm_off", "info_vllm_off", "solutions_off",
          "info_solutions_off", "info_otel_off", "storage_only", "emit_metric_resolution",
-         "emit_15s", "emit_1h", "surge_on_delete") + LOGS_OFF_RENDERS
+         "emit_15s", "emit_1h", "emit_null", "surge_on_delete") + LOGS_OFF_RENDERS
 
 GREEN, RED, YELLOW, RESET = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
 passed = failed = 0
@@ -811,6 +812,7 @@ def emit(name):
 check("emitInterval empty follows metricResolution (20s)", emit("emit_metric_resolution") == "20s")
 check('emitInterval "15s" is used as is', emit("emit_15s") == "15s")
 check('emitInterval "1h" is used as is', emit("emit_1h") == "1h")
+check("emitInterval null renders as emitInterval empty", same_render("emit_null", "info_logs_on"))
 
 
 def duration_error(setting, value):
