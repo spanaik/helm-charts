@@ -1268,10 +1268,10 @@ otelContainerInsights:
         ## "<N>s", "<N>m" or "<N>h", between 1s and 24h.
         emitInterval: ""
         ## How often the agent checks the log file of each vLLM container. Only applies
-        ## with otelContainerInsights.logs.enabled false. Empty = 2s, or the effective
-        ## emitInterval when that is shorter. "<N>s", "<N>m" or "<N>h", between 1s and
-        ## 24h. A value above 2s can miss the startup line of a container whose log
-        ## rotates within seconds of its start.
+        ## with otelContainerInsights.logs.enabled false. Empty = 2s, or 1s when the
+        ## effective emit interval (emitInterval, or metricResolution when that is empty)
+        ## is 1s. "<N>s", "<N>m" or "<N>h", between 1s and 24h. A value above 2s can miss
+        ## the startup line of a container whose log rotates within seconds of its start.
         pollInterval: ""
         ## Maximum number of vLLM containers tracked per agent (1-100000).
         maxEntities: 500

@@ -395,9 +395,11 @@ receivers:
   # predictor pod, or a container whose image name contains vllm (any case). A change
   # to one of them needs the same change in the other. A pod without a label gets an
   # empty string for it, so the rule works for every pod. Like the scrape job, the pod
-  # watch skips init containers and pods that are not running.
+  # watch skips init containers and pods that are not running. It also skips a
+  # container that is not running, until it runs.
   # receiver_creator sets k8s.namespace.name, k8s.pod.name, k8s.pod.uid and
   # k8s.container.name from the pod watch, so the records need no file name parse.
+  # It also sets container.id and container.image.name, which the connector does not use.
   receiver_creator/cw_k8s_ci_v0_vllm_logs:
     watch_observers: [k8s_observer/cw_k8s_ci_v0_vllm]
     receivers:

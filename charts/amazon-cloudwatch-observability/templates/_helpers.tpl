@@ -480,7 +480,9 @@ otelContainerInsights.metricResolution when that is empty. Checked by
 otel-container-insights.vllmInfoDuration.
 */}}
 {{- define "otel-container-insights.vllmInfoEmitInterval" -}}
-{{- $configured := .Values.otelContainerInsights.solutions.vllm.configInfo.emitInterval | toString -}}
+{{- /* A null value (for example --set ...emitInterval=null) counts as empty. */ -}}
+{{- $value := .Values.otelContainerInsights.solutions.vllm.configInfo.emitInterval -}}
+{{- $configured := ternary "" ($value | toString) (kindIs "invalid" $value) -}}
 {{- $source := "otelContainerInsights.solutions.vllm.configInfo.emitInterval" -}}
 {{- $raw := $configured -}}
 {{- if eq $configured "" -}}
@@ -521,7 +523,9 @@ empty when it is not set. otel-container-insights.config checks it whenever conf
 so a bad value fails at once even with logs on, where it has no effect.
 */}}
 {{- define "otel-container-insights.vllmInfoPollInterval" -}}
-{{- $configured := .Values.otelContainerInsights.solutions.vllm.configInfo.pollInterval | toString -}}
+{{- /* A null value (for example --set ...pollInterval=null) counts as empty. */ -}}
+{{- $value := .Values.otelContainerInsights.solutions.vllm.configInfo.pollInterval -}}
+{{- $configured := ternary "" ($value | toString) (kindIs "invalid" $value) -}}
 {{- if ne $configured "" -}}
   {{- include "otel-container-insights.vllmInfoDuration" (dict "name" "otelContainerInsights.solutions.vllm.configInfo.pollInterval" "value" $configured) -}}
 {{- end -}}

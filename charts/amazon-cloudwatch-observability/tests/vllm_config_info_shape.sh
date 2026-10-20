@@ -18,8 +18,8 @@
 #      solutions.enabled, solutions.vllm.enabled and configInfo.enabled.
 #   3. Logs on: no new pipeline. The connector is a second exporter of
 #      logs/cw_k8s_ci_v0_app and a second receiver of metrics/cw_k8s_ci_v0_vllm.
-#      Opt-in: with SET1_REF set (for example SET1_REF=8e8f228, the change that
-#      shipped the metric with logs on only), every logs-on render, and every logs-off
+#      Opt-in: with SET1_REF set to the commit that shipped the metric with logs on
+#      only (the change before this one), every logs-on render, and every logs-off
 #      render with configInfo off, is compared byte for byte with the chart at that
 #      ref. A failing render must fail with the same message.
 #   4. Logs off: k8s_observer/cw_k8s_ci_v0_vllm watches the pods of the node, and
@@ -135,7 +135,7 @@ BASE_STATUS="skipped: set BASE_REF (for example BASE_REF=origin/main) to compare
 if [[ -n "$BASE_REF" ]]; then
     BASE_STATUS="$(extract_ref "$BASE_REF" "${TMP_DIR}/base")"
 fi
-SET1_STATUS="skipped: set SET1_REF (for example SET1_REF=8e8f228) to compare"
+SET1_STATUS="skipped: set SET1_REF (the commit that shipped the metric with logs on only) to compare"
 if [[ -n "$SET1_REF" ]]; then
     SET1_STATUS="$(extract_ref "$SET1_REF" "${TMP_DIR}/set1")"
 fi
@@ -180,6 +180,7 @@ same_as_set1 storage_only "${OTEL[@]}" "${STORAGE_ON[@]}"
 same_as_set1 emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set "${CI}.metricResolution=20s"
 same_as_set1 emit_15s "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=15s"
 same_as_set1 emit_1h "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=1h"
+same_as_set1 emit_null "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=null"
 for bad in 15 0s 25h 1m30s abc; do
     same_as_set1 "emit_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=${bad}"
 done
@@ -237,6 +238,8 @@ logs_off_set bad_poll fails "pollInterval 500ms" --set "${CONFIG_INFO}.pollInter
 # Logs off, configInfo on: the poll interval and each bound on its own.
 LO_INFO=("${OTEL[@]}" "${LOGS_OFF[@]}" "${INFO[@]}")
 render "$CHART_DIR" poll_emit_1s "${LO_INFO[@]}" --set "${CONFIG_INFO}.emitInterval=1s"
+render "$CHART_DIR" poll_null "${LO_INFO[@]}" --set "${CONFIG_INFO}.pollInterval=null"
+render "$CHART_DIR" lo_emit_null "${LO_INFO[@]}" --set "${CONFIG_INFO}.emitInterval=null"
 render "$CHART_DIR" poll_emit_5s "${LO_INFO[@]}" --set "${CONFIG_INFO}.emitInterval=5s"
 render "$CHART_DIR" poll_emit_2m "${LO_INFO[@]}" --set "${CONFIG_INFO}.emitInterval=2m"
 render "$CHART_DIR" poll_resolution_1s "${LO_INFO[@]}" --set "${CI}.metricResolution=1s"
@@ -340,7 +343,8 @@ LO = "lo_defaults_info"
 MODES = ("default", "logs_on", "logs_on_tuned", "logs_on_surge", "info_logs_on",
          "info_storage_logs_on", "vllm_off", "info_vllm_off", "solutions_off",
          "info_solutions_off", "info_otel_off", "info_otel_off_logs_off", "storage_only",
-         "emit_metric_resolution", "emit_15s", "emit_1h", "surge_on_delete", "poll_set_10s_logs_on",
+         "emit_metric_resolution", "emit_15s", "emit_1h", "emit_null", "poll_null", "lo_emit_null",
+         "surge_on_delete", "poll_set_10s_logs_on",
          "poll_emit_5s_logs_on", "poll_emit_1s", "poll_emit_5s", "poll_emit_2m", "poll_resolution_1s",
          "poll_set_10s", "poll_set_10s_emit_5s", "poll_set_1h") + \
     tuple(f"lo_{n}_plain" for n, _, _ in LOGS_OFF_SETS) + tuple(f"lo_{n}_info" for n in LO_RENDERING)
@@ -1201,6 +1205,9 @@ check("logs on: pollInterval 10s has no effect (the render is the configInfo-on,
       rc("poll_set_10s_logs_on") == 0 and redacted("poll_set_10s_logs_on") == redacted("info_logs_on"))
 check("logs on: emitInterval 5s does not add a poll interval anywhere",
       rc("poll_emit_5s_logs_on") == 0 and "poll_interval" not in json.dumps(otel_config("poll_emit_5s_logs_on")))
+check("logs on: emitInterval null renders as emitInterval empty", same_render("emit_null", "info_logs_on"))
+check("logs off: emitInterval null renders as emitInterval empty", same_render("lo_emit_null", LO))
+check("logs off: pollInterval null renders as pollInterval empty", same_render("poll_null", LO))
 for name, value, desc in (*((f"poll_bad_{bad}", bad, f'logs off, pollInterval "{bad}"')
                             for bad in ("500ms", "0s", "25h", "15", "abc")),
                           ("poll_bad_500ms_logs_on", "500ms", 'logs on, pollInterval "500ms"'),

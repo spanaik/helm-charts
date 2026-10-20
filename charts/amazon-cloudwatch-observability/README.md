@@ -159,11 +159,11 @@ With logs off, the agent ships no logs, and it reads the vLLM logs as follows:
 - A label change, an annotation change, or a container restart restarts the reader of that
   container. The reader has no checkpoint. So it then reads the current log of that container
   again from the beginning, up to the kubelet log size limit (10 MiB by default).
-- A controller that edits vLLM pod labels or annotations often causes repeated reads. The facts do
-  not depend on checkpoints.
+- A controller that edits vLLM pod labels or annotations often causes repeated reads. The series
+  stays correct, because the facts do not depend on checkpoints. Only the reads cost CPU.
 - The agent checks the log file of each vLLM container every `configInfo.pollInterval`. Empty means
-  2s. When `emitInterval` is shorter than 2s, empty means `emitInterval`. The value is `<N>s`,
-  `<N>m` or `<N>h`, from 1s to 24h.
+  2s. If the emit interval is 1s, empty means 1s. The value is `<N>s`, `<N>m` or `<N>h`, from 1s
+  to 24h.
 - A static vLLM pod gets no series in this mode. Its log directory uses the UID that kubelet gives
   the static pod, and this UID differs from the mirror pod UID in the API.
 - This mode needs an agent release with the `signal_to_info_metric` connector and the
