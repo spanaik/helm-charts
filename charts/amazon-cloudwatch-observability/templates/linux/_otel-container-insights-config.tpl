@@ -371,6 +371,11 @@ receivers:
     # above 2s can miss the startup line of a pod whose log rotates within seconds of
     # its start.
     poll_interval: {{ include "otel-container-insights.vllmInfoLogsOffPollInterval" . }}
+    # Raw UTF-8 does not check each line for invalid UTF-8 bytes or replace them, which
+    # cut the agent CPU by 7 percent in a test at 20,000 lines/s. This is safe here: no
+    # log is shipped in this mode, and the connector replaces invalid UTF-8 in each value
+    # that it emits.
+    encoding: utf8-raw
     {{- end }}
     include_file_path: true
     include_file_name: false
@@ -387,11 +392,21 @@ receivers:
       # form. Any other directory suffix, such as the kubelet's config hash of a static
       # pod (whose mirror pod has another UID in the API), leaves uid empty, and the
       # connector stores no empty value, so that series has no UID check.
+      # The parse result is the same for every line of a file, so the parser caches it. In
+      # a test at 20,000 lines/s, this cut the agent CPU by 30 percent, with the same output.
+      # The key is the whole log.file.path value, so the cache holds one entry of about
+      # 0.7 KB for each file read since the agent started, up to 1024 files (cache.size is
+      # a uint16, at most 65535). When the cache is full, each new path removes the oldest
+      # entry, and on amd64 the parser stops adding entries about a minute after the first
+      # removal until the agent restarts, so it then parses every line of a file that is
+      # not in the cache.
       - type: regex_parser
         id: extract_metadata_from_filepath
         regex: '^/var/log/pods/(?P<namespace>[^_/]+)_(?P<pod>[^_/]+)_(?:(?P<uid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|[^/]+)/(?P<container>[^/]+)/[0-9]+\.log$'
         parse_from: attributes["log.file.path"]
         parse_to: resource
+        cache:
+          size: 1024
       {{- end }}
       - type: move
         from: resource.pod

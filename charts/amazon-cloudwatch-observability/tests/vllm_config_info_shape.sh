@@ -19,10 +19,12 @@
 #   3. Logs-off mode (configInfo on, logs.enabled off): the app-log pipeline runs only
 #      to feed the connector, ships nothing, and has no processors. Its receiver reads
 #      the kubelet's /var/log/pods files (the same containers as /var/log/containers
-#      with logs on), parses the names and the pod UID from that path in one regex, and
-#      polls every configInfo.pollInterval, or every 2s (or every emit interval, when that
-#      is shorter) when it is empty. In every mode, every defined component is used and
-#      every used component is defined.
+#      with logs on), parses the names and the pod UID from that path in one regex with
+#      a cache of 1024 paths, reads with encoding utf8-raw, and polls every
+#      configInfo.pollInterval, or every 2s (or every emit interval, when that is
+#      shorter) when it is empty. The logs-on receiver has neither the cache nor the
+#      encoding. In every mode, every defined component is used and every used
+#      component is defined.
 #   4. Identity: the connector keys on the namespace, pod and container that the
 #      app-log receiver parses from the log file name, and also stores the k8s.pod.uid
 #      of the record. Before k8sattributes, that stored UID is set aside. Right after
@@ -193,8 +195,14 @@ PODS_INCLUDE = ["/var/log/pods/*/*/*.log"]
 PODS_EXCLUDE = [f"/var/log/pods/*_{p}*/*/*.log" for p in ("cloudwatch-agent", "fluent-bit", "aws-node", "kube-proxy")]
 PODS_REGEX = (r"^/var/log/pods/(?P<namespace>[^_/]+)_(?P<pod>[^_/]+)_(?:(?P<uid>[0-9a-f]{8}-[0-9a-f]{4}"
               r"-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|[^/]+)/(?P<container>[^/]+)/[0-9]+\.log$")
+# The parse result depends only on the path, so logs-off mode caches it per path.
+PODS_CACHE_SIZE = 1024
 PODS_PARSER = {"type": "regex_parser", "id": "extract_metadata_from_filepath", "regex": PODS_REGEX,
-               "parse_from": 'attributes["log.file.path"]', "parse_to": "resource"}
+               "parse_from": 'attributes["log.file.path"]', "parse_to": "resource",
+               "cache": {"size": PODS_CACHE_SIZE}}
+# Logs-off mode skips the UTF-8 check: nothing is shipped, and the connector replaces
+# invalid UTF-8 in the values that it emits.
+LOGS_OFF_ENCODING = "utf8-raw"
 UID_MOVE = {"type": "move", "from": "resource.uid", "to": 'resource["k8s.pod.uid"]', "on_error": "send_quiet"}
 # Every mode the checks below look at, for the component cross-checks.
 MODES = ("default", "logs_on", "logs_off", "logs_on_tuned", "logs_off_tuned", "info_logs_on",
@@ -580,6 +588,9 @@ check(f"logs on: {APP_RECEIVER} reads /var/log/containers, with no poll_interval
       on_receiver.get("include") == ["/var/log/containers/*.log"] and "poll_interval" not in on_receiver and
       "include_file_path_resolved" not in on_receiver and
       not any(o.get("from") == "resource.uid" for o in on_receiver.get("operators") or []))
+on_parsers = [o for o in on_receiver.get("operators") or [] if o.get("type") == "regex_parser"]
+check(f"logs on: {APP_RECEIVER} has no encoding (the utf-8 default), and its regex_parser no cache",
+      "encoding" not in on_receiver and len(on_parsers) == 1 and "cache" not in on_parsers[0])
 
 # 4. Identity and liveness.
 SAMPLE_UID = "5f2c8a1e-3b4d-4e6f-9a0b-1c2d3e4f5a6b"
@@ -683,6 +694,24 @@ lo_receiver = section(lo, "receivers").get(APP_RECEIVER) or {}
 check(f"{APP_RECEIVER} starts at the beginning (nothing is shipped)", lo_receiver.get("start_at") == "beginning")
 check(f"{APP_RECEIVER} polls every 2s (pollInterval empty, emitInterval 30s, the defaults)",
       lo_receiver.get("poll_interval") == "2s")
+lo_parsers = [o for o in lo_receiver.get("operators") or [] if o.get("type") == "regex_parser"]
+check(f"{APP_RECEIVER} reads with encoding {LOGS_OFF_ENCODING}, and its regex_parser caches "
+      f"{PODS_CACHE_SIZE} paths",
+      lo_receiver.get("encoding") == LOGS_OFF_ENCODING and len(lo_parsers) == 1 and
+      lo_parsers[0].get("cache") == {"size": PODS_CACHE_SIZE})
+# Every render with the app-log receiver: the encoding and the cache in logs-off mode only.
+by_layout = {"logs off": [], "logs on": []}
+for name in MODES:
+    rec = section(otel_config(name), "receivers").get(APP_RECEIVER)
+    if rec is not None:
+        by_layout["logs off" if rec.get("include") == PODS_INCLUDE else "logs on"].append((name, rec))
+for layout, want in (("logs off", (LOGS_OFF_ENCODING, [{"size": PODS_CACHE_SIZE}])), ("logs on", (None, [None]))):
+    wrong = [name for name, rec in by_layout[layout]
+             if (rec.get("encoding"), [o.get("cache") for o in rec.get("operators") or []
+                                       if o.get("type") == "regex_parser"]) != want]
+    if not check(f"every {layout} render ({len(by_layout[layout])}): {APP_RECEIVER} encoding {want[0]}, "
+                 f"regex_parser cache {want[1][0]}", bool(by_layout[layout]) and not wrong):
+        print(f"    wrong in {wrong}")
 check(f"{APP_RECEIVER} reads /var/log/pods with the logs-on excludes in that layout, and no "
       "include_file_path_resolved",
       lo_receiver.get("include") == PODS_INCLUDE and lo_receiver.get("exclude") == PODS_EXCLUDE and

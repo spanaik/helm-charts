@@ -144,15 +144,20 @@ Without checkpoints, the same applies to a vLLM pod that starts while the agent 
 settings that the agent already has survive the restart.
 
 With `otelContainerInsights.logs.enabled=false`, the agent still reads the pod logs on the
-node, but only for this metric. It uses only the engine startup line and ships no logs. In this
-mode the agent always keeps checkpoints in the storage. On its first start it reads the
-current log file of each container from the beginning. If the startup line of a running engine
-is still in the current file, the agent finds it. Kubelet rotates a log file at 10 MiB by default,
-and the agent does not read rotated files. After a restart the agent continues from where it
+node, but only for this metric. It uses only the engine startup line and ships no logs. In a
+test at 20,000 log lines per second, the agent used about 8 microseconds of CPU for each line.
+It also used about 94 microseconds for each log file at each check. A cache for the parse of
+each file path, and reading lines without a UTF-8 check, cut this cost by about a third. So a
+busy node with many log lines uses more agent CPU in this mode than with the metric off: 165
+millicores instead of 11 in that test. In this mode the agent always keeps checkpoints in the
+storage. On its first start it reads the current log file of each container from the
+beginning. If the startup line of a running engine is still in the current file, the agent
+finds it. Kubelet rotates a log file at 10 MiB by default, and the agent does not read rotated
+files. After a restart the agent continues from where it
 stopped. In this mode the agent checks the log files every 2 seconds. If `emitInterval` is
 shorter, the agent checks them every `emitInterval`. To use another interval, set
 `configInfo.pollInterval`, in the same format as `emitInterval`. A longer interval uses less
-CPU on a node with many quiet pods, about 94 microseconds for each log file at each check. But
+CPU on a node with many quiet pods, because of the cost for each log file at each check. But
 above 2 seconds, the agent can miss the startup line of a pod whose log file rotates within
 seconds of its start. The agent sends a new series as soon as it reads the startup line. So the
 series starts within one check interval after the engine writes the line.
