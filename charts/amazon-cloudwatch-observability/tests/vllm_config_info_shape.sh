@@ -326,7 +326,8 @@ ORDERING = {"regex": r"/(?P<restart>[0-9]+)\.log\z", "top_n": 1,
 TEMPLATE_CONFIG = {
     "include": ["/var/log/pods/`pod.namespace`_`pod.name`_`pod.uid`/`container_name`/*.log"],
     "ordering_criteria": ORDERING, "start_at": "beginning", "include_file_path": False,
-    "include_file_name": False, "poll_interval": "2s", "operators": [CONTAINER_LOG_PARSER]}
+    "include_file_name": False, "preserve_trailing_whitespaces": True, "poll_interval": "2s",
+    "operators": [CONTAINER_LOG_PARSER]}
 
 with open(os.path.join(TMP, "logs_off_sets")) as f:
     LOGS_OFF_SETS = [tuple(line.rstrip("\n").split("\t", 2)) for line in f if line.strip()]
@@ -979,6 +980,8 @@ check(f"logs off: {TEMPLATE} reads only the newest restart file (numeric sort, d
 check(f"logs off: {TEMPLATE} reads from the start, with no storage, no encoding, no exclude",
       template_cfg.get("start_at") == "beginning" and
       not any(k in template_cfg for k in ("storage", "encoding", "exclude", "max_concurrent_files")))
+check(f"logs off: {TEMPLATE} keeps trailing whitespace, so an empty CRI line parses",
+      template_cfg.get("preserve_trailing_whitespaces") is True)
 check(f"logs off: {TEMPLATE} parses no path (no regex parser, no file name or path attribute)",
       template_cfg.get("include_file_path") is False and template_cfg.get("include_file_name") is False and
       not any(o.get("type") == "regex_parser" or "regex" in o for o in template_cfg.get("operators") or []))

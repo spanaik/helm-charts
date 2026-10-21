@@ -427,6 +427,9 @@ receivers:
           start_at: beginning
           include_file_path: false
           include_file_name: false
+          # Keep the trailing space of an empty line, "<time> stdout F ".
+          # container_log_parser needs it, and logs an error for each empty line without it.
+          preserve_trailing_whitespaces: true
           poll_interval: {{ include "otel-container-insights.vllmInfoLogsOffPollInterval" . }}
           operators:
             - id: parse_container_log
