@@ -18,7 +18,7 @@
 #      solutions.enabled, solutions.vllm.enabled and configInfo.enabled.
 #   3. Logs on: no new pipeline. The connector is a second exporter of
 #      logs/cw_k8s_ci_v0_app and a second receiver of metrics/cw_k8s_ci_v0_vllm.
-#      Opt-in: with SET1_REF set to the commit that shipped the metric with logs on
+#      Opt-in: with LOGS_ON_REF set to the commit that shipped the metric with logs on
 #      only (the change before this one), every logs-on render, and every logs-off
 #      render with configInfo off, is compared byte for byte with the chart at that
 #      ref. A failing render must fail with the same message.
@@ -59,7 +59,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HELM="${HELM:-helm}"
 BASE_REF="${BASE_REF:-}"
-SET1_REF="${SET1_REF:-}"
+LOGS_ON_REF="${LOGS_ON_REF:-}"
 VLLM_RULE_FILE="${VLLM_RULE_FILE:-}"
 JOBS="$(nproc 2>/dev/null || echo 4)"
 TMP_DIR="$(mktemp -d)"
@@ -130,34 +130,34 @@ extract_ref() {
     fi
 }
 
-# The chart at BASE_REF and at SET1_REF, for the byte-identity checks.
+# The chart at BASE_REF and at LOGS_ON_REF, for the byte-identity checks.
 BASE_STATUS="skipped: set BASE_REF (for example BASE_REF=origin/main) to compare"
 if [[ -n "$BASE_REF" ]]; then
     BASE_STATUS="$(extract_ref "$BASE_REF" "${TMP_DIR}/base")"
 fi
-SET1_STATUS="skipped: set SET1_REF (the commit that shipped the metric with logs on only) to compare"
-if [[ -n "$SET1_REF" ]]; then
-    SET1_STATUS="$(extract_ref "$SET1_REF" "${TMP_DIR}/set1")"
+LOGS_ON_STATUS="skipped: set LOGS_ON_REF (the commit that shipped the metric with logs on only) to compare"
+if [[ -n "$LOGS_ON_REF" ]]; then
+    LOGS_ON_STATUS="$(extract_ref "$LOGS_ON_REF" "${TMP_DIR}/logs_on")"
 fi
 
-# same_as_set1 <name> [helm args...]: renders <name>, and set1_<name> with the chart at
-# SET1_REF. same_as_base also renders base_<name> with the chart at BASE_REF.
-: > "${TMP_DIR}/set1_names"
+# same_as_logs_on <name> [helm args...]: renders <name>, and logs_on_<name> with the chart at
+# LOGS_ON_REF. same_as_base also renders base_<name> with the chart at BASE_REF.
+: > "${TMP_DIR}/logs_on_names"
 : > "${TMP_DIR}/base_names"
-same_as_set1() {
+same_as_logs_on() {
     local name="$1"
     shift
-    echo "$name" >> "${TMP_DIR}/set1_names"
+    echo "$name" >> "${TMP_DIR}/logs_on_names"
     render "$CHART_DIR" "$name" "$@"
-    if [[ "$SET1_STATUS" == "ok" ]]; then
-        render "${TMP_DIR}/set1" "set1_${name}" "$@"
+    if [[ "$LOGS_ON_STATUS" == "ok" ]]; then
+        render "${TMP_DIR}/logs_on" "logs_on_${name}" "$@"
     fi
 }
 same_as_base() {
     local name="$1"
     shift
     echo "$name" >> "${TMP_DIR}/base_names"
-    same_as_set1 "$name" "$@"
+    same_as_logs_on "$name" "$@"
     if [[ "$BASE_STATUS" == "ok" ]]; then
         render "${TMP_DIR}/base" "base_${name}" "$@"
     fi
@@ -174,42 +174,42 @@ same_as_base solutions_off "${OTEL[@]}" --set "${CI}.solutions.enabled=false"
 same_as_base info_solutions_off "${OTEL[@]}" "${INFO[@]}" --set "${CI}.solutions.enabled=false"
 same_as_base info_otel_off "${INFO[@]}"
 same_as_base info_otel_off_logs_off "${INFO[@]}" "${LOGS_OFF[@]}"
-same_as_set1 info_logs_on "${OTEL[@]}" "${INFO[@]}"
-same_as_set1 info_storage_logs_on "${OTEL[@]}" "${INFO[@]}" "${STORAGE_ON[@]}"
-same_as_set1 storage_only "${OTEL[@]}" "${STORAGE_ON[@]}"
-same_as_set1 emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set "${CI}.metricResolution=20s"
-same_as_set1 emit_15s "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=15s"
-same_as_set1 emit_1h "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=1h"
-same_as_set1 emit_null "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=null"
+same_as_logs_on info_logs_on "${OTEL[@]}" "${INFO[@]}"
+same_as_logs_on info_storage_logs_on "${OTEL[@]}" "${INFO[@]}" "${STORAGE_ON[@]}"
+same_as_logs_on storage_only "${OTEL[@]}" "${STORAGE_ON[@]}"
+same_as_logs_on emit_metric_resolution "${OTEL[@]}" "${INFO[@]}" --set "${CI}.metricResolution=20s"
+same_as_logs_on emit_15s "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=15s"
+same_as_logs_on emit_1h "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=1h"
+same_as_logs_on emit_null "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=null"
 for bad in 15 0s 25h 1m30s abc; do
-    same_as_set1 "emit_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=${bad}"
+    same_as_logs_on "emit_bad_${bad}" "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=${bad}"
 done
 # emitInterval empty: the metricResolution fallback is out of the connector's bounds.
-same_as_set1 emit_bad_resolution "${OTEL[@]}" "${INFO[@]}" --set "${CI}.metricResolution=90000s"
-same_as_set1 bad_max_state_bytes "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxStateBytes=1000"
-same_as_set1 bad_max_value_length "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxValueLength=2000"
-same_as_set1 bad_max_entities "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxEntities=0"
-same_as_set1 bad_host_path "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=relative/dir"
-same_as_set1 bad_host_path_dot "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/."
-same_as_set1 bad_host_path_dotdot "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/.."
-same_as_set1 bad_host_path_inner "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/./lib/x"
-same_as_set1 good_host_path_dots "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/lib/.state..d"
-same_as_set1 surge_info "${OTEL[@]}" "${INFO[@]}" "${MAX_SURGE_1[@]}"
-same_as_set1 surge_storage "${OTEL[@]}" "${STORAGE_ON[@]}" "${MAX_SURGE_1[@]}"
-same_as_set1 surge_agents_entry "${OTEL[@]}" "${INFO[@]}" "${AGENTS_SURGE_10[@]}"
-same_as_set1 surge_on_delete "${OTEL[@]}" "${INFO[@]}" --set agent.updateStrategy.type=OnDelete
-# pollInterval has no effect with logs on: a valid value renders as set 1 does.
-same_as_set1 poll_set_10s_logs_on "${OTEL[@]}" "${INFO[@]}" "${POLL_10S[@]}"
-same_as_set1 poll_emit_5s_logs_on "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=5s"
-# A bad value still fails while configInfo is on (set 1 has no pollInterval and renders it).
+same_as_logs_on emit_bad_resolution "${OTEL[@]}" "${INFO[@]}" --set "${CI}.metricResolution=90000s"
+same_as_logs_on bad_max_state_bytes "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxStateBytes=1000"
+same_as_logs_on bad_max_value_length "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxValueLength=2000"
+same_as_logs_on bad_max_entities "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.maxEntities=0"
+same_as_logs_on bad_host_path "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=relative/dir"
+same_as_logs_on bad_host_path_dot "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/."
+same_as_logs_on bad_host_path_dotdot "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/.."
+same_as_logs_on bad_host_path_inner "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/./lib/x"
+same_as_logs_on good_host_path_dots "${OTEL[@]}" "${STORAGE_ON[@]}" --set "${CI}.stateStorage.hostPath=/var/lib/.state..d"
+same_as_logs_on surge_info "${OTEL[@]}" "${INFO[@]}" "${MAX_SURGE_1[@]}"
+same_as_logs_on surge_storage "${OTEL[@]}" "${STORAGE_ON[@]}" "${MAX_SURGE_1[@]}"
+same_as_logs_on surge_agents_entry "${OTEL[@]}" "${INFO[@]}" "${AGENTS_SURGE_10[@]}"
+same_as_logs_on surge_on_delete "${OTEL[@]}" "${INFO[@]}" --set agent.updateStrategy.type=OnDelete
+# pollInterval has no effect with logs on: a valid value renders as the logs-on chart does.
+same_as_logs_on poll_set_10s_logs_on "${OTEL[@]}" "${INFO[@]}" "${POLL_10S[@]}"
+same_as_logs_on poll_emit_5s_logs_on "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.emitInterval=5s"
+# A bad value still fails while configInfo is on (the logs-on chart has no pollInterval and renders it).
 render "$CHART_DIR" poll_bad_500ms_logs_on "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.pollInterval=500ms"
-if [[ "$SET1_STATUS" == "ok" ]]; then
-    render "${TMP_DIR}/set1" set1_poll_bad_500ms_logs_on "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.pollInterval=500ms"
+if [[ "$LOGS_ON_STATUS" == "ok" ]]; then
+    render "${TMP_DIR}/logs_on" logs_on_poll_bad_500ms_logs_on "${OTEL[@]}" "${INFO[@]}" --set "${CONFIG_INFO}.pollInterval=500ms"
 fi
 
 # Logs off. logs_off_set <name> <renders|fails> <description> [helm args...] renders
 # lo_<name>_info (configInfo on, which renders or fails as stated) and lo_<name>_plain
-# (configInfo off, which must render as at SET1_REF and BASE_REF), both with logs off.
+# (configInfo off, which must render as at LOGS_ON_REF and BASE_REF), both with logs off.
 : > "${TMP_DIR}/logs_off_sets"
 logs_off_set() {
     local name="$1" outcome="$2" desc="$3"
@@ -260,7 +260,7 @@ render "$CHART_DIR" lo_bad_host_path_inner "${LO_INFO[@]}" --set "${CI}.stateSto
 render "$CHART_DIR" lo_good_host_path_dots "${LO_INFO[@]}" --set "${CI}.stateStorage.hostPath=/var/lib/.state..d"
 wait
 
-python3 - "${TMP_DIR}" "${BASE_REF}" "${BASE_STATUS}" "${SET1_REF}" "${SET1_STATUS}" "${VLLM_RULE_FILE}" <<'PY'
+python3 - "${TMP_DIR}" "${BASE_REF}" "${BASE_STATUS}" "${LOGS_ON_REF}" "${LOGS_ON_STATUS}" "${VLLM_RULE_FILE}" <<'PY'
 import copy
 import functools
 import itertools
@@ -274,7 +274,7 @@ import yaml
 # The C loader when PyYAML has it: the checks parse each render several times.
 LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
-TMP, BASE_REF, BASE_STATUS, SET1_REF, SET1_STATUS, RULE_FILE = sys.argv[1:7]
+TMP, BASE_REF, BASE_STATUS, LOGS_ON_REF, LOGS_ON_STATUS, RULE_FILE = sys.argv[1:7]
 
 AGENT = "cloudwatch-agent"
 SCRAPER = "cloudwatch-agent-cluster-scraper"
@@ -331,8 +331,8 @@ TEMPLATE_CONFIG = {
 
 with open(os.path.join(TMP, "logs_off_sets")) as f:
     LOGS_OFF_SETS = [tuple(line.rstrip("\n").split("\t", 2)) for line in f if line.strip()]
-with open(os.path.join(TMP, "set1_names")) as f:
-    SET1_NAMES = [line.strip() for line in f if line.strip()]
+with open(os.path.join(TMP, "logs_on_names")) as f:
+    LOGS_ON_NAMES = [line.strip() for line in f if line.strip()]
 with open(os.path.join(TMP, "base_names")) as f:
     BASE_NAMES = [line.strip() for line in f if line.strip()]
 LO_RENDERING = [n for n, outcome, _ in LOGS_OFF_SETS if outcome == "renders"]
@@ -724,21 +724,21 @@ for set_name in ("vllm_off", "solutions_off"):
     check(f"logs off, {set_name}: configInfo on renders as configInfo off",
           same_render(f"lo_{set_name}_info", f"lo_{set_name}_plain"))
 
-# --- 3. Set 1: logs on is unchanged ------------------------------------------------
-print(f"\n{YELLOW}[logs on and configInfo off: as at SET1_REF]{RESET}")
-if SET1_STATUS == "ok":
-    for name in SET1_NAMES:
-        if not check(f"{name} is byte-identical to {SET1_REF}, or fails with the same message",
-                     same_outcome(name, f"set1_{name}")):
-            for n in (name, f"set1_{name}"):
+# --- 3. Logs on is unchanged -------------------------------------------------------
+print(f"\n{YELLOW}[logs on and configInfo off: as at LOGS_ON_REF]{RESET}")
+if LOGS_ON_STATUS == "ok":
+    for name in LOGS_ON_NAMES:
+        if not check(f"{name} is byte-identical to {LOGS_ON_REF}, or fails with the same message",
+                     same_outcome(name, f"logs_on_{name}")):
+            for n in (name, f"logs_on_{name}"):
                 if rc(n) != 0:
                     show_err(n)
-    check(f"logs on, pollInterval 500ms: fails here, and renders at {SET1_REF} as configInfo on (no pollInterval there)",
-          rc("poll_bad_500ms_logs_on") != 0 and same_render("set1_poll_bad_500ms_logs_on", "set1_info_logs_on"))
-elif SET1_REF:
-    check(f"SET1_REF {SET1_REF} resolves in this checkout", False)
+    check(f"logs on, pollInterval 500ms: fails here, and renders at {LOGS_ON_REF} as configInfo on (no pollInterval there)",
+          rc("poll_bad_500ms_logs_on") != 0 and same_render("logs_on_poll_bad_500ms_logs_on", "logs_on_info_logs_on"))
+elif LOGS_ON_REF:
+    check(f"LOGS_ON_REF {LOGS_ON_REF} resolves in this checkout", False)
 else:
-    skip(f"byte identity with the logs-on-only chart ({SET1_STATUS})")
+    skip(f"byte identity with the logs-on-only chart ({LOGS_ON_STATUS})")
 
 # --- configInfo on + logs on --------------------------------------------------------
 print(f"\n{YELLOW}[configInfo on, logs on]{RESET}")
