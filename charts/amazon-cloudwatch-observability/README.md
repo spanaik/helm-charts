@@ -174,7 +174,14 @@ per second, with application logs shipped, the node agent used 62.47 millicores 
 `configInfo` off and 62.40 millicores with it on. Its mean memory (RSS) was 138.7 MiB with
 `configInfo` off and 140.3 MiB with it on.
 
-<!-- logs-off cost: phase 6b -->
+With logs off, the metric adds 3 to 4 millicores of CPU to the node agent. On an EKS test node with
+six vLLM test containers, the node agent used these amounts of CPU, with `configInfo` off and on:
+
+- 10.20 and 13.44 millicores with no other log load.
+- 11.15 and 14.58 millicores while other pods wrote 2000 log lines per second.
+- 13.85 and 17.59 millicores while other pods wrote 20,000 log lines per second.
+
+Its mean memory (RSS) changed by 3 MiB or less. The agent does not read the logs of the other pods.
 
 A new `emitInterval`, `pollInterval` or cap reaches the agent only after its pod restarts,
 because the operator updates the agent configuration, not the pod.
