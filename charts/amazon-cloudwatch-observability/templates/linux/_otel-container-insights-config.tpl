@@ -569,6 +569,13 @@ processors:
         - 'not IsMatch(name, "^(vllm:|http_).*")'
         - 'IsMatch(name, ".*_created$")'
         - 'type == METRIC_DATA_TYPE_SUMMARY'
+
+  # PoC: attach vLLM engine configuration values as vllm.config.* attributes to
+  # the vllm:* families that each value explains. It runs before any processor
+  # can change the receiver's scrape target attributes, which it uses to find
+  # the pod.
+  vllmconfig/cw_k8s_ci_v0_vllm:
+    node_name: ${env:K8S_NODE_NAME}
   {{- end }}
 
   transform/cw_k8s_ci_v0_set_scope_lis_csi:
@@ -1332,6 +1339,7 @@ service:
       processors:
         - filter/cw_k8s_ci_v0_scrape_metadata
         - filter/cw_k8s_ci_v0_vllm_keep
+        - vllmconfig/cw_k8s_ci_v0_vllm
         - transform/cw_k8s_ci_v0_drop_deprecated_semconv
         - transform/cw_k8s_ci_v0_set_unit
         - metricstarttime/cw_k8s_ci_v0
