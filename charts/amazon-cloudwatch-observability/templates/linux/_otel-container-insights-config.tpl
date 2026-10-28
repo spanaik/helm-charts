@@ -573,7 +573,11 @@ processors:
   # PoC: attach vLLM engine configuration values as vllm.config.* attributes to
   # the vllm:* families that each value explains. It runs before any processor
   # can change the receiver's scrape target attributes, which it uses to find
-  # the pod.
+  # the pod. Only the PoC agent image has this processor; any other image
+  # crash-loops on the unknown component type, so refuse to render instead.
+  {{- if not (hasPrefix "1.0.99-vllmconfig" (toString .Values.agent.image.tag)) }}
+  {{- fail "This PoC chart runs the vllmconfig processor, which only the PoC agent image has. Set agent.image to cloudwatch-agent-vllm-info-poc:1.0.99-vllmconfig-poc1 with the values file that comes with this chart, or set otelContainerInsights.solutions.vllm.enabled=false." }}
+  {{- end }}
   vllmconfig/cw_k8s_ci_v0_vllm:
     node_name: ${env:K8S_NODE_NAME}
   {{- end }}
