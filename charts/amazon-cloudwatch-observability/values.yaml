@@ -1231,6 +1231,10 @@ otelContainerInsights:
     ## See the chart README.
     vllm:
       enabled: true
+    ## SGLang (PoC) — the model server's own metrics (sglang:* series), from
+    ## any container running an SGLang image started with --enable-metrics.
+    sglang:
+      enabled: true
     ## KServe — operator health from the kserve-controller-manager, via its
     ## kube-rbac-proxy on :8443. Scraped by the cluster-scraper.
     kserve:

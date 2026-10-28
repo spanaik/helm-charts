@@ -241,6 +241,55 @@ receivers:
               action: replace
   {{- end }}
 
+  {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.sglang.enabled }}
+  # PoC: SGLang model-server metrics, scraped per node like the vLLM job. SGLang
+  # serves /metrics only with --enable-metrics, on its HTTP port.
+  prometheus/cw_k8s_ci_v0_sglang:
+    config:
+      scrape_configs:
+        - job_name: sglang
+          scrape_interval: {{ .Values.otelContainerInsights.metricResolution }}
+          scrape_timeout: {{ include "otel-container-insights.scrapeTimeout" . }}
+          metrics_path: /metrics
+          kubernetes_sd_configs:
+            - role: pod
+              selectors:
+                - role: pod
+                  field: spec.nodeName=${env:K8S_NODE_NAME}
+          relabel_configs:
+            # Found without configuration: any container running an SGLang image.
+            - source_labels: [__meta_kubernetes_pod_container_image]
+              regex: '(?i).*sglang.*'
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_container_init]
+              regex: "true"
+              action: drop
+            - source_labels: [__meta_kubernetes_pod_phase]
+              regex: Running
+              action: keep
+            # A container declaring no port gets SGLang's default HTTP port, 30000.
+            - source_labels: [__meta_kubernetes_pod_container_port_number]
+              regex: ""
+              target_label: __tmp_port
+              replacement: "30000"
+              action: replace
+            - source_labels: [__meta_kubernetes_pod_container_port_number]
+              regex: "([0-9]+)"
+              target_label: __tmp_port
+              action: replace
+            - source_labels: [__meta_kubernetes_pod_ip, __tmp_port]
+              separator: ":"
+              regex: "(.+:[0-9]+)"
+              target_label: __address__
+              action: replace
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+              action: replace
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+              action: replace
+  {{- end }}
+
   kubeletstats/cw_k8s_ci_v0:
     auth_type: serviceAccount
     collection_interval: {{ .Values.otelContainerInsights.metricResolution }}
@@ -570,16 +619,70 @@ processors:
         - 'IsMatch(name, ".*_created$")'
         - 'type == METRIC_DATA_TYPE_SUMMARY'
 
-  # PoC: attach vLLM engine configuration values as vllm.config.* attributes to
-  # the vllm:* families that each value explains. It runs before any processor
-  # can change the receiver's scrape target attributes, which it uses to find
-  # the pod. Only the PoC agent image has this processor; any other image
-  # crash-loops on the unknown component type, so refuse to render instead.
-  {{- if not (hasPrefix "1.0.99-vllmconfig" (toString .Values.agent.image.tag)) }}
-  {{- fail "This PoC chart runs the vllmconfig processor, which only the PoC agent image has. Set agent.image to cloudwatch-agent-vllm-info-poc:1.0.99-vllmconfig-poc1 with the values file that comes with this chart, or set otelContainerInsights.solutions.vllm.enabled=false." }}
-  {{- end }}
-  vllmconfig/cw_k8s_ci_v0_vllm:
+  # PoC: one engine configuration record per vLLM container, in two shapes side
+  # by side: on the vllm:num_requests_running data points (anchor), and as one
+  # Info series per engine (info). It runs before any processor can change the
+  # receiver's scrape target attributes, which it uses to find the pod. The
+  # startup log line gives the effective values that no route or metric gives;
+  # the agent reads it from the pod log file and ships no log.
+  {{- include "otel-container-insights.engineconfigGuard" . }}
+  engineconfig/cw_k8s_ci_v0_vllm:
+    engine: vllm
     node_name: ${env:K8S_NODE_NAME}
+    shapes: [anchor, info]
+    log_fallback: true
+  {{- end }}
+
+  {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.sglang.enabled }}
+  transform/cw_k8s_ci_v0_set_scope_sglang:
+    error_mode: ignore
+    metric_statements:
+      - context: scope
+        statements:
+          - set(scope.name, "github.com/sgl-project/sglang")
+          - set(scope.schema_url, "")
+          - set(attributes["cloudwatch.source"], "cloudwatch-agent")
+          - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
+          - set(attributes["cloudwatch.pipeline"], "sglang")
+
+  transform/cw_k8s_ci_v0_sglang_promote:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(resource.attributes["k8s.pod.name"], attributes["pod"]) where attributes["pod"] != nil
+          - set(resource.attributes["k8s.namespace.name"], attributes["namespace"]) where attributes["namespace"] != nil
+          - set(resource.attributes["aws.service.type"], "ai_inference")
+
+  # Same precedence as the vLLM rule: InferenceService, then workload, then pod.
+  transform/cw_k8s_ci_v0_sglang_service_name:
+    error_mode: ignore
+    metric_statements:
+      - context: resource
+        statements:
+          - set(attributes["service.name"], attributes["k8s.pod.name"]) where attributes["k8s.pod.name"] != nil
+          - set(attributes["service.name"], attributes["k8s.workload.name"]) where attributes["k8s.workload.name"] != nil
+          - set(attributes["service.name"], attributes["k8s.pod.label.serving.kserve.io/inferenceservice"]) where attributes["k8s.pod.label.serving.kserve.io/inferenceservice"] != nil
+          - set(attributes["service.namespace"], attributes["k8s.namespace.name"]) where attributes["k8s.namespace.name"] != nil
+
+  # Keep the engine's own series. SGLang's HTTP and process series are not
+  # model-server telemetry, and summaries are rejected by the CloudWatch OTLP
+  # endpoint.
+  filter/cw_k8s_ci_v0_sglang_keep:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'not IsMatch(name, "^sglang:.*")'
+        - 'IsMatch(name, ".*_created$")'
+        - 'type == METRIC_DATA_TYPE_SUMMARY'
+
+  # PoC: the same engine configuration record as for vLLM, from /server_info
+  # and the SGLang flags in the pod spec.
+  {{- include "otel-container-insights.engineconfigGuard" . }}
+  engineconfig/cw_k8s_ci_v0_sglang:
+    engine: sglang
+    node_name: ${env:K8S_NODE_NAME}
+    shapes: [anchor, info]
   {{- end }}
 
   transform/cw_k8s_ci_v0_set_scope_lis_csi:
@@ -1343,7 +1446,7 @@ service:
       processors:
         - filter/cw_k8s_ci_v0_scrape_metadata
         - filter/cw_k8s_ci_v0_vllm_keep
-        - vllmconfig/cw_k8s_ci_v0_vllm
+        - engineconfig/cw_k8s_ci_v0_vllm
         - transform/cw_k8s_ci_v0_drop_deprecated_semconv
         - transform/cw_k8s_ci_v0_set_unit
         - metricstarttime/cw_k8s_ci_v0
@@ -1359,6 +1462,35 @@ service:
         - transform/cw_k8s_ci_v0_clear_schema_url
         - transform/cw_k8s_ci_v0_set_workload
         - transform/cw_k8s_ci_v0_vllm_service_name
+        - transform/cw_k8s_ci_v0_pod_topology
+        - awsattributelimit/cw_k8s_ci_v0
+        - batch/cw_k8s_ci_v0_metrics_dest
+      exporters:
+        - otlphttp/cw_k8s_ci_v0_metrics_dest
+{{- end }}
+
+{{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.sglang.enabled }}
+    metrics/cw_k8s_ci_v0_sglang:
+      receivers: [prometheus/cw_k8s_ci_v0_sglang]
+      processors:
+        - filter/cw_k8s_ci_v0_scrape_metadata
+        - filter/cw_k8s_ci_v0_sglang_keep
+        - engineconfig/cw_k8s_ci_v0_sglang
+        - transform/cw_k8s_ci_v0_drop_deprecated_semconv
+        - transform/cw_k8s_ci_v0_set_unit
+        - metricstarttime/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_set_cluster_name
+        - transform/cw_k8s_ci_v0_sglang_promote
+        - k8sattributes/cw_k8s_ci_v0_pod
+        - transform/cw_k8s_ci_v0_set_node_name
+        - transform/cw_k8s_ci_v0_promote_node_name
+        - resourcedetection/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_set_cloud_resource_id
+        - k8sattributes/cw_k8s_ci_v0_node
+        - transform/cw_k8s_ci_v0_set_scope_sglang
+        - transform/cw_k8s_ci_v0_clear_schema_url
+        - transform/cw_k8s_ci_v0_set_workload
+        - transform/cw_k8s_ci_v0_sglang_service_name
         - transform/cw_k8s_ci_v0_pod_topology
         - awsattributelimit/cw_k8s_ci_v0
         - batch/cw_k8s_ci_v0_metrics_dest

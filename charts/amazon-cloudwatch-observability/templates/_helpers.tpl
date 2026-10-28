@@ -1009,3 +1009,14 @@ winning on key collision.
 {{- end -}}
 {{- $out | toYaml -}}
 {{- end -}}
+
+{{/*
+PoC guard for the engineconfig processor in the vLLM and SGLang pipelines. Only
+the PoC agent image has this processor; any other image crash-loops on the
+unknown component type, so refuse to render instead.
+*/}}
+{{- define "otel-container-insights.engineconfigGuard" -}}
+{{- if not (hasPrefix "1.0.99-engineconfig" (toString .Values.agent.image.tag)) -}}
+  {{- fail "This PoC chart runs the engineconfig processor, which only the PoC agent image has. Set agent.image to cloudwatch-agent-vllm-info-poc:1.0.99-engineconfig-poc1, or set otelContainerInsights.solutions.vllm.enabled=false and otelContainerInsights.solutions.sglang.enabled=false." -}}
+{{- end -}}
+{{- end }}
