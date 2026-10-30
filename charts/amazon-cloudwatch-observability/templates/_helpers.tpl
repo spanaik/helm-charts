@@ -444,6 +444,57 @@ Validates metricResolution is in "<N>s" format.
 {{- end -}}
 {{- end -}}
 
+{{/*
+"true" when the agent re-sends the vLLM engine startup line every hour
+(log_replay/cw_k8s_ci_v0_vllm), empty otherwise. This is the one switch for everything that
+the re-send adds. The agent reads the line in the application-log pipeline, so it needs
+otelContainerInsights.logs.enabled and the vLLM solution. With logs off, the chart renders
+nothing for it, so nothing is published.
+*/}}
+{{- define "otel-container-insights.vllmLogReplayEnabled" -}}
+{{- $ci := .Values.otelContainerInsights -}}
+{{- if and $ci.enabled $ci.logs.enabled $ci.solutions.enabled $ci.solutions.vllm.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when the node agent gets the state storage (file_storage/cw_k8s_ci_v0_state and its
+hostPath mount), empty otherwise. Its only user is log_replay/cw_k8s_ci_v0_vllm, which keeps
+the startup line of each vLLM container there, so that the re-send continues after an agent
+restart.
+*/}}
+{{- define "otel-container-insights.stateStorageEnabled" -}}
+{{- include "otel-container-insights.vllmLogReplayEnabled" . -}}
+{{- end -}}
+
+{{/*
+Node directory of the state storage. The agent mounts it read-write at the same path.
+*/}}
+{{- define "otel-container-insights.stateStorageHostPath" -}}
+/var/lib/amazon-cloudwatch-agent/otel-state
+{{- end -}}
+
+{{/*
+Fail when two agent pods on one node could share the state storage. file_storage holds an
+exclusive bbolt file lock on each of its database files, so during a rolling update with
+maxSurge above 0 the new pod starts while the old one still holds the locks, and its storage
+clients time out. Takes a dict with "agent" (the merged agent entry), "agentName" and "context";
+only the targetAgent is checked. Evaluates maxSurge the way the custom resource renders it.
+*/}}
+{{- define "otel-container-insights.validateStateStorageRollout" -}}
+{{- $ctx := .context -}}
+{{- if and (include "otel-container-insights.stateStorageEnabled" $ctx) (eq .agentName $ctx.Values.otelContainerInsights.targetAgent) -}}
+{{- $strategy := .agent.updateStrategy | default dict -}}
+{{- if eq ($strategy.type | toString) "RollingUpdate" -}}
+{{- $maxSurge := dig "rollingUpdate" "maxSurge" "" $strategy | default (include "cloudwatch-agent.rolloutStrategyMaxSurge" (dict "mode" .agent.mode)) | toString -}}
+{{- if not (regexMatch "^0+%?$" $maxSurge) -}}
+  {{- fail (printf "agent %s: with otelContainerInsights.logs.enabled and the vLLM solution, the agent keeps state in file_storage/cw_k8s_ci_v0_state, which requires updateStrategy.rollingUpdate.maxSurge 0, got: %s. The file_storage extension's bbolt files are locked by one agent pod at a time, so a surge pod on the same node cannot open them." .agentName $maxSurge) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "cloudwatch-agent.rolloutStrategyMaxUnavailable" -}}
 {{- if eq .mode "daemonset" -}}
 1

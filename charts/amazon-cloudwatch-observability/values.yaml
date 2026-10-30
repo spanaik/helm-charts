@@ -1228,6 +1228,12 @@ otelContainerInsights:
     ## vLLM — the model server's own metrics (vllm:* and http_* series).
     ## Scrapes the model container of KServe InferenceService pods and any
     ## container running a vLLM image.
+    ## With otelContainerInsights.logs.enabled true, the node agent also re-sends
+    ## the engine startup log line of each vLLM container every hour, and keeps
+    ## it in a node directory (/var/lib/amazon-cloudwatch-agent/otel-state) so
+    ## that the re-send survives an agent restart. The agent's
+    ## updateStrategy.rollingUpdate.maxSurge must then stay 0 (the DaemonSet
+    ## default). With logs off, nothing is re-sent.
     ## See the chart README.
     vllm:
       enabled: true

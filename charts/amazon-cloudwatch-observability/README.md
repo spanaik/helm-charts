@@ -68,6 +68,39 @@ runs `k8sattributes` pod association, so `k8s.workload.name` resolves to the own
 Deployment rather than to the ReplicaSet — whose pod-template hash likewise changes on
 every redeploy.
 
+### The vLLM engine startup line
+
+A vLLM engine logs its release, its model, and its effective configuration one time, in its
+startup line, for example:
+
+```
+(EngineCore pid=211) INFO 10-15 12:41:46 [core.py:134] Initializing a V1 LLM engine (v0.31.1) with config: model='meta-llama/Llama-3.1-70B-Instruct', ..., dtype=torch.bfloat16, max_seq_len=131072, ..., tensor_parallel_size=4, ...
+```
+
+With `otelContainerInsights.logs.enabled` true, the node agent keeps the latest startup line of
+each vLLM container on its node. Every hour, it sends an exact copy of each kept line to the
+application log group, `/aws/otel/containerinsights/<cluster>/application`. Only the time of a copy differs from
+the original. Thus, a query over the last two hours finds the line of every running engine, also
+for an engine that started weeks ago. The copies of a container stop within one hour after the
+kubelet removes the container. A copy and the original line have the same content, so the start
+time of an engine is the start time of its pod.
+
+This CloudWatch Logs Insights query returns the latest startup line of each container:
+
+```
+fields @timestamp, @message
+| filter @message like /LLM engine \(v/
+| sort @timestamp desc
+```
+
+The agent keeps the lines in `/var/lib/amazon-cloudwatch-agent/otel-state` on the node, so the
+copies continue after an agent restart. The directory is a read-write hostPath of the node agent.
+One agent pod at a time can use it, so the agent's `updateStrategy.rollingUpdate.maxSurge` must
+stay 0, which is the DaemonSet default. The chart does not render otherwise.
+
+With `otelContainerInsights.logs.enabled` false, the chart renders none of this, and nothing is
+sent.
+
 ## KServe control-plane metrics
 
 Set under `otelContainerInsights.solutions.kserve.controlPlane`, on by default. The

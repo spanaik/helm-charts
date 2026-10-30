@@ -1,4 +1,7 @@
 {{- define "otel-container-insights.config" -}}
+{{- /* The hourly re-send of the vLLM engine startup line: log_replay/cw_k8s_ci_v0_vllm and
+file_storage/cw_k8s_ci_v0_state. Off unless otelContainerInsights.logs.enabled is true. */ -}}
+{{- $logReplay := eq (include "otel-container-insights.vllmLogReplayEnabled" .) "true" -}}
 extensions:
   sigv4auth/cw_k8s_ci_v0_metrics_dest:
     region: {{ .Values.region }}
@@ -10,6 +13,22 @@ extensions:
   awscloudwatchlogsprovisioner/cw_k8s_ci_v0_logs:
     region: {{ .Values.region }}
     additional_auth: sigv4auth/cw_k8s_ci_v0_logs_dest
+{{- end }}
+{{- if $logReplay }}
+  {{- $stateDir := include "otel-container-insights.stateStorageHostPath" . }}
+  # Agent state that must survive a restart: the vLLM engine startup line of each
+  # container, for its hourly re-send. One bbolt file per component, in the hostPath
+  # that the targetAgent DaemonSet mounts read-write at the same path.
+  file_storage/cw_k8s_ci_v0_state:
+    directory: {{ $stateDir | quote }}
+    create_directory: true
+    compaction:
+      on_start: true
+      on_rebound: true
+      directory: {{ $stateDir | quote }}
+    # A file that bbolt cannot open (corrupted by a node crash) is renamed aside
+    # and recreated empty, rather than keeping the agent from starting.
+    recreate: true
 {{- end }}
 
 receivers:
@@ -1291,6 +1310,40 @@ exporters:
 
 {{- end }}
 
+{{- if $logReplay }}
+
+connectors:
+  # The vLLM engine startup line ("Initializing a V1 LLM engine (v0.29.0) with config:
+  # model=..., dtype=..., tensor_parallel_size=...") appears once, when the engine starts.
+  # This connector keeps the latest startup line of each vLLM container and sends an
+  # exact copy of it every hour, with the current time, through the application-log
+  # exporter. So every one-hour window of the application log group holds the line of
+  # each running engine. The copies stop when the kubelet removes the container's log
+  # file. The kept lines are in file_storage/cw_k8s_ci_v0_state, so the copies continue
+  # after an agent restart.
+  #
+  # The configuration is the same as connector/logreplayconnector/testdata/vllm_rule.yaml
+  # in the amazon-cloudwatch-agent repository, with the storage. A change to one of them
+  # needs the same change in the other.
+  log_replay/cw_k8s_ci_v0_vllm:
+    storage: file_storage/cw_k8s_ci_v0_state
+    interval: 1h
+    # filelog/cw_k8s_ci_v0_app sets log.file.path to the /var/log/containers symlink of
+    # the container log, which the kubelet removes with the container.
+    source_file_attribute: log.file.path
+    rules:
+      - name: vllm_engine_config
+        # Plain substring match, no regex: the startup line of every vLLM version,
+        # from before the V0/V1 split ("an LLM engine") to the V1 engine.
+        body_contains:
+          - "Initializing an LLM engine (v"
+          - "Initializing a V0 LLM engine (v"
+          - "Initializing a V1 LLM engine (v"
+        # filelog/cw_k8s_ci_v0_app reads these names from the container log file name,
+        # so every record has them. Two containers of one pod are two entries.
+        identity: [k8s.namespace.name, k8s.pod.name, k8s.container.name]
+{{- end }}
+
 service:
   # Pin internal self-telemetry off. Without this the collector falls back to its
   # built-in default (metrics level Normal + a Prometheus reader on localhost:8888),
@@ -1303,6 +1356,9 @@ service:
 {{- if .Values.otelContainerInsights.logs.enabled }}
     - sigv4auth/cw_k8s_ci_v0_logs_dest
     - awscloudwatchlogsprovisioner/cw_k8s_ci_v0_logs
+{{- end }}
+{{- if $logReplay }}
+    - file_storage/cw_k8s_ci_v0_state
 {{- end }}
   pipelines:
 {{- if .Values.nodeExporter.enabled }}
@@ -1582,6 +1638,21 @@ service:
         - batch/cw_k8s_ci_v0_logs_dest
       exporters:
         - otlphttp/cw_k8s_ci_v0_app_logs_dest
+        {{- if $logReplay }}
+        - log_replay/cw_k8s_ci_v0_vllm
+        {{- end }}
+    {{- if $logReplay }}
+
+    # ── CI Logs: hourly copies of the vLLM engine startup line ──
+    # The copies are full records from the end of logs/cw_k8s_ci_v0_app, so they need
+    # no enrichment, and they go to the same log group and log stream as the original.
+    logs/cw_k8s_ci_v0_vllm_replay:
+      receivers: [log_replay/cw_k8s_ci_v0_vllm]
+      processors:
+        - batch/cw_k8s_ci_v0_logs_dest
+      exporters:
+        - otlphttp/cw_k8s_ci_v0_app_logs_dest
+    {{- end }}
 
     # ── CI Logs: Host pipeline ──
     # Intentionally omits k8sattributes/pod and set_workload — host logs
