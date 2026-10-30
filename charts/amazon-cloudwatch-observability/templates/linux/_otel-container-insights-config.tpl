@@ -1327,7 +1327,8 @@ connectors:
   # needs the same change in the other.
   log_replay/cw_k8s_ci_v0_vllm:
     storage: file_storage/cw_k8s_ci_v0_state
-    interval: 1h
+    # PoC only (not in the chart PR): pocLogReplayInterval shortens the interval for a test.
+    interval: {{ .Values.otelContainerInsights.solutions.vllm.pocLogReplayInterval | default "1h" }}
     # filelog/cw_k8s_ci_v0_app sets log.file.path to the /var/log/containers symlink of
     # the container log, which the kubelet removes with the container.
     source_file_attribute: log.file.path
