@@ -626,6 +626,57 @@ manager:
       requests:
         cpu: 50m
         memory: 128Mi
+  ## Model-server tracing: the operator points vLLM and SGLang containers at the
+  ## OTLP endpoint above, so that each inference request produces a span with
+  ## gen_ai.* attributes (queue time, time to first token, prefill and decode
+  ## time, prompt and completion tokens).
+  ##
+  ## Both engines ship their own OpenTelemetry tracing and the OTLP exporter in
+  ## their images, and both read the endpoint from a command-line argument, not
+  ## from an environment variable. So the operator appends the argument to the
+  ## engine container: --otlp-traces-endpoint for vLLM, and that plus
+  ## --enable-trace for SGLang. Nothing is mounted and no SDK is injected.
+  ##
+  ## The engine joins the caller's trace, because both engines read W3C
+  ## traceparent. An agent or a load generator instrumented by Application
+  ## Signals therefore appears as the parent of the engine's span. Until the
+  ## argument is set the engine drops the incoming trace context, so this is
+  ## what connects an agent to the model it calls.
+  ##
+  ## This turns the Python SDK injection off for the engine container, which is
+  ## the condition for engine tracing to work at all. Both engines create their
+  ## spans from the global OpenTelemetry tracer provider, and the Application
+  ## Signals distro installs that provider first, so the engine's own exporter
+  ## then receives nothing. Measured on a live cluster on 2026-11-23: with the
+  ## distro present, no engine span arrived, and spans flowed as soon as it was
+  ## gone. The engine keeps its Prometheus metrics either way, and the other
+  ## languages are left alone, because they install no Python provider.
+  ##
+  ## Needs otlp.enabled and otlp.grpc.enabled, and the render fails without
+  ## them. A container is skipped when the pod spec already names the endpoint,
+  ## when its command runs a shell, and when it sets no command and no args,
+  ## because in those two cases the argument would do nothing or would replace
+  ## the image's own command line. Opt one workload out with the pod or
+  ## namespace annotation cloudwatch.aws.amazon.com/inject-engine-traces: "false".
+  ##
+  ## X-Ray charges per trace and vLLM emits one span per request with no
+  ## sampling of its own, so set the sampler on a busy endpoint. The sampler is
+  ## parent-based by default, which keeps one decision for the whole request:
+  ## the caller decides, and the engine follows.
+  engineTracing:
+    enabled: false
+    ## OTLP/gRPC address as host:port. Empty uses the node agent's Service and
+    ## otlp.grpc.port. A scheme is removed if you write one.
+    endpoint: ""
+    ## OTEL_TRACES_SAMPLER and OTEL_TRACES_SAMPLER_ARG for the engine, set only
+    ## when sampler is not empty. Example: parentbased_traceidratio with 0.1.
+    sampler: ""
+    samplerArg: ""
+    ## Leave Python auto-instrumentation on the engine container. Set this only
+    ## for an engine that exports from the provider it configured rather than
+    ## from the global one. No released vLLM or SGLang does that yet, so with
+    ## true on a current engine you get Application Signals and no engine span.
+    keepApplicationSignals: false
   autoAnnotateAutoInstrumentation:
     java:
       namespaces: []

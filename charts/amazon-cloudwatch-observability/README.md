@@ -407,6 +407,90 @@ reach the node on those ports, not only by pods in the cluster. Kubernetes netwo
 do not apply to host-network pods, so restrict the ports with the nodes' security groups or a
 host firewall if other senders must not reach them, or set `otlp.enabled: false`.
 
+## Model-server traces
+
+The endpoint above receives traces, but a model server sends none until its command line
+names the endpoint. Set `manager.engineTracing.enabled: true` and the operator appends that
+argument to every vLLM and SGLang container it admits:
+
+```yaml
+manager:
+  engineTracing:
+    enabled: true
+    ## Optional. Empty uses the node agent and otlp.grpc.port.
+    endpoint: ""
+    ## Optional. X-Ray charges per trace, and the engines do not sample.
+    sampler: parentbased_traceidratio
+    samplerArg: "0.1"
+```
+
+Each request then produces one span with `gen_ai.*` attributes: queue time, time to first
+token, prefill and decode time, the model name, and the prompt and completion token counts.
+The Prometheus metrics above hold the same measurements as histograms, for the whole
+workload. A span holds them for one request.
+
+The span also joins the caller's trace. Both engines read the W3C `traceparent` header, so an
+agent or a client that Application Signals instruments becomes the parent of the engine's
+span, and one trace then covers the agent, the proxy and the model. Until the argument is
+set, the engine drops the incoming trace context, which is why an agent's trace ends at the
+model today.
+
+Nothing is mounted and no language SDK is injected. The engines carry their own
+OpenTelemetry tracing and the OTLP exporter in their images, so the argument is all they
+need. The operator adds `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` and `OTEL_PROPAGATORS` to the
+container, and names the service for SGLang only, because SGLang reports itself as `sglang`
+when nothing else is set while vLLM leaves the name to the agent.
+
+### It turns Python auto-instrumentation off for the engine
+
+This is the condition for engine tracing to work at all, so the operator does it for you on
+the engine container. Both engines create their spans from the global OpenTelemetry tracer
+provider. The Application Signals distro installs that provider first, at interpreter start,
+so the engine's call to install its own is refused and its exporter receives nothing.
+
+Measured on a live cluster on 2026-11-23, with the argument set the whole time: no engine
+span arrived while the distro was present, and spans flowed within a minute of removing it.
+What you get instead is richer for a model server. One trace held the calling agent, its
+HTTP client span and the engine's `llm_request` span, with 13.6 ms to first token, 11.1 ms
+of prefill, 210 ms of decode, 45 prompt tokens and 27 completion tokens.
+
+The engine keeps its Prometheus metrics either way, and Java, Node.js and .NET injection is
+left alone, because none of them installs a Python provider. To keep Application Signals on
+an engine instead, opt that workload out of engine tracing with the annotation above.
+
+The engine also inherits the caller's sampling decision, because its sampler is parent
+based. A request whose caller did not sample produces no engine span.
+
+The cause is in the engines, and it is fixable there: both build a tracer provider for the
+endpoint and then read spans back off the global provider, which another integration may
+own. An engine that exported from the provider it configured would work with Application
+Signals beside it. For such an engine, set `manager.engineTracing.keepApplicationSignals`
+to true and both run together. On a current engine that setting gives you Application
+Signals and no engine span, which is why it is false by default.
+
+### Which containers are changed
+
+A container whose image name holds `vllm` or `sglang`, after the registry and the
+organization, so `vllm/vllm-openai` is an engine and `vllm/router` is not. For a private
+image that carries no such name, set the pod annotation
+`cloudwatch.aws.amazon.com/engine-traces-engine` to `vllm` or `sglang` on the KServe model
+container.
+
+Three containers are left alone, because the argument would do harm or nothing:
+
+- one whose pod spec already names `--otlp-traces-endpoint`;
+- one whose command runs a shell, where the argument becomes the shell's own;
+- one that sets no command and no args, where a new `args` would replace the image's `CMD`.
+
+Opt a workload out with `cloudwatch.aws.amazon.com/inject-engine-traces: "false"` on the pod
+or on its namespace. Per-pod overrides of the endpoint and the sampler use the annotations
+`cloudwatch.aws.amazon.com/engine-traces-endpoint`,
+`cloudwatch.aws.amazon.com/engine-traces-sampler` and
+`cloudwatch.aws.amazon.com/engine-traces-sampler-arg`.
+
+The operator changes a pod when it is created, so restart a running engine to pick the
+argument up.
+
 ## Service identity
 
 The agent sets the service identity on OTLP telemetry and on OTEL Container Insights metrics

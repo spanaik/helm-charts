@@ -62,6 +62,22 @@ empty.
 {{- end -}}
 
 {{/*
+The OTLP/gRPC address of the chart's endpoint as host:port, with no scheme, for
+in-cluster senders that take a bare address: <node agent>.<release namespace>:<otlp.grpc.port>,
+through the node agent's Service. Model servers are the case this exists for,
+because vLLM takes a URL and SGLang takes host:port, so the caller adds the
+scheme it needs. Empty when the endpoint does not serve OTLP/gRPC: otlp.enabled
+or otlp.grpc.enabled is false, or no agent renders as the node agent. A caller
+that needs the endpoint should fail the render when this is empty.
+*/}}
+{{- define "otlp.grpcEndpointHostPort" -}}
+{{- $otlp := .Values.otlp }}
+{{- if and $otlp.enabled $otlp.grpc.enabled (include "otlp.nodeAgentRendered" .) }}
+{{- printf "%s.%s:%d" (include "cloudwatch-agent.name" .) .Release.Namespace (int64 $otlp.grpc.port) }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Ports the agent already listens on, which the OTLP receiver must not take:
 X-Ray (2000), the agent server (4311), the cluster scraper's entity endpoint
 (4314), Application Signals (4315, 4316), StatsD (8125), collectd (25826)

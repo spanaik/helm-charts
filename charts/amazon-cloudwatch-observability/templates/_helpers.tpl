@@ -373,6 +373,60 @@ Logic:
 {{- end -}}
 
 {{/*
+The OTLP/gRPC address the operator points model servers at: manager.engineTracing.endpoint
+when set, and the node agent's own OTLP/gRPC address otherwise. Empty when neither is
+available, which engine-tracing.validate turns into a render failure.
+*/}}
+{{- define "engine-tracing.endpoint" -}}
+{{- $engineTracing := .Values.manager.engineTracing | default dict }}
+{{- if $engineTracing.endpoint }}
+{{- $engineTracing.endpoint }}
+{{- else if .Values.agent.enabled }}
+{{- include "otlp.grpcEndpointHostPort" . }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Validates manager.engineTracing. Types and unknown keys are checked whether or not the
+feature is enabled, so a bad value does not wait for the day it is turned on. The checks
+that need the OTLP endpoint run only when enabled is true.
+
+Called from the operator Deployment rather than from cloudwatch-agent.validate-flags,
+because that one runs from the agent template and so not at all with agent.enabled false,
+which is exactly a case this has to reject.
+*/}}
+{{- define "engine-tracing.validate" -}}
+{{- $engineTracing := .Values.manager.engineTracing | default dict }}
+{{- if not (kindIs "map" $engineTracing) }}
+{{- fail "manager.engineTracing must be a map with enabled, endpoint, sampler, samplerArg and keepApplicationSignals" }}
+{{- end }}
+{{- range $key, $_ := $engineTracing }}
+{{- if not (has $key (list "enabled" "endpoint" "sampler" "samplerArg" "keepApplicationSignals")) }}
+{{- fail (printf "manager.engineTracing has an unknown key %q (allowed: enabled, endpoint, sampler, samplerArg, keepApplicationSignals)" $key) }}
+{{- end }}
+{{- end }}
+{{- range $key := list "enabled" "keepApplicationSignals" }}
+{{- if not (kindIs "bool" (dig $key false $engineTracing)) }}
+{{- fail (printf "manager.engineTracing.%s must be a boolean (true/false)" $key) }}
+{{- end }}
+{{- end }}
+{{- range $key := list "endpoint" "sampler" "samplerArg" }}
+{{- $value := dig $key "" $engineTracing }}
+{{- if not (kindIs "string" $value) }}
+{{- fail (printf "manager.engineTracing.%s must be a string, got: %v" $key $value) }}
+{{- end }}
+{{- end }}
+{{- if dig "enabled" false $engineTracing }}
+{{- if and (dig "samplerArg" "" $engineTracing) (not (dig "sampler" "" $engineTracing)) }}
+{{- fail "manager.engineTracing.samplerArg is set without manager.engineTracing.sampler, which the engine would ignore" }}
+{{- end }}
+{{- if not (include "engine-tracing.endpoint" .) }}
+{{- fail "manager.engineTracing.enabled requires the node agent's OTLP gRPC endpoint: agent.enabled, otlp.enabled, otlp.grpc.enabled, and an agents entry named like the node agent (agent.name, default cloudwatch-agent). Set manager.engineTracing.endpoint to send to a collector of your own instead" }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Validates otelPrometheusMonitor when it is enabled. Called from cloudwatch-agent.validate-flags.
   - targetAgent and clusterScraperAgent are set and differ.
   - With otelContainerInsights also enabled, both agent names match otelContainerInsights:

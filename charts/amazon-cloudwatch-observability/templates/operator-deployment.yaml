@@ -41,7 +41,21 @@ spec:
         - "--auto-instrumentation-dotnet-image={{ template "auto-instrumentation-dotnet.image" . }}"
         - "--auto-instrumentation-nodejs-image={{ template "auto-instrumentation-nodejs.image" . }}"
         - "--target-allocator-image={{ template "target-allocator.image" (merge .Values.agent.prometheus.targetAllocator.image (dict "region" $.Values.region)) }}"
-        - "--feature-gates=operator.autoinstrumentation.multiinstrumentation,operator.autoinstrumentation.multiinstrumentation.skipcontainervalidation"
+        {{- include "engine-tracing.validate" . }}
+        {{- $engineTracing := .Values.manager.engineTracing | default dict }}
+        - "--feature-gates=operator.autoinstrumentation.multiinstrumentation,operator.autoinstrumentation.multiinstrumentation.skipcontainervalidation{{ if $engineTracing.enabled }},operator.engine.tracing{{ end }}"
+        {{- if $engineTracing.enabled }}
+        - "--engine-traces-endpoint={{ include "engine-tracing.endpoint" . }}"
+        {{- if $engineTracing.keepApplicationSignals }}
+        - "--engine-traces-keep-application-signals"
+        {{- end }}
+        {{- if $engineTracing.sampler }}
+        - "--engine-traces-sampler={{ $engineTracing.sampler }}"
+        {{- if $engineTracing.samplerArg }}
+        - "--engine-traces-sampler-arg={{ $engineTracing.samplerArg }}"
+        {{- end }}
+        {{- end }}
+        {{- end }}
         {{- if eq (include "amazon-cloudwatch-observability.managePrometheusCRDs" .) "true" }}
         - "--manage-prometheus-crds"
         {{- end }}
